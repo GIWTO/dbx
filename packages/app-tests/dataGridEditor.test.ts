@@ -2,10 +2,11 @@ import { strict as assert } from "node:assert";
 import { test } from "vitest";
 import { computed, nextTick, ref } from "vue";
 import { createPinia, setActivePinia } from "pinia";
-import { DATA_GRID_QUICK_ENTRY_DRAFT_ROW_ID, useDataGridEditor } from "../../apps/desktop/src/composables/useDataGridEditor.ts";
+import { DATA_GRID_MAX_BATCH_INSERT_ROWS, DATA_GRID_QUICK_ENTRY_DRAFT_ROW_ID, useDataGridEditor } from "../../apps/desktop/src/composables/useDataGridEditor.ts";
 import type { CellValue } from "../../apps/desktop/src/lib/dataGrid/cellValue.ts";
 import type { DataGridSaveStatementOptions } from "../../apps/desktop/src/lib/dataGrid/dataGridSql.ts";
 import { matchesRowStatusFilter, type RowStatusFilter } from "../../apps/desktop/src/lib/dataGrid/gridRowStatus.ts";
+import { useConnectionStore } from "../../apps/desktop/src/stores/connectionStore.ts";
 import type { ColumnInfo } from "../../apps/desktop/src/types/database.ts";
 
 function installBrowserTestGlobals() {
@@ -51,8 +52,10 @@ function mockPreparedSaveStatements(options: DataGridSaveStatementOptions): stri
     statements.push(`UPDATE ${table} SET ${sets} WHERE ${primaryKeyWhere(options, row)};`);
   }
   for (const row of options.newRows) {
-    const columns = options.columns.map(quotePgIdentifier).join(", ");
-    const values = row.map((value) => formatGridSqlLiteral(value, options.databaseType)).join(", ");
+    const sourceColumns = options.sourceColumns?.length === options.columns.length ? options.sourceColumns : options.columns;
+    const insertColumns = sourceColumns.flatMap((column, index) => (column ? [{ column, index }] : []));
+    const columns = insertColumns.map(({ column }) => quotePgIdentifier(column)).join(", ");
+    const values = insertColumns.map(({ index }) => formatGridSqlLiteral(row[index], options.databaseType)).join(", ");
     statements.push(`INSERT INTO ${table} (${columns}) VALUES (${values});`);
   }
   return statements;
@@ -109,7 +112,7 @@ function createQuickEntryEditor(options: {
   rowStatusFilter?: ReturnType<typeof ref<RowStatusFilter>>;
   filterRowsInGetRowItem?: boolean;
   supportsInsert?: boolean;
-  save?: (changes: { dirtyRows: Map<number, Map<number, CellValue>>; newRows: CellValue[][] }) => Promise<void>;
+  save?: (changes: { dirtyRows: Map<number, Map<number, CellValue>>; newRows: CellValue[][]; newRowMeta: Array<{ sourceIndex?: number; editedColumns?: number[] }> }) => Promise<void>;
 }) {
   const result = computed(() => ({
     columns: ["id", "name"],
@@ -125,7 +128,7 @@ function createQuickEntryEditor(options: {
     database: computed(() => undefined),
     tableMeta: computed(() => ({
       tableName: "people",
-      columns: [column("id", true), column("name")],
+      columns: [{ ...column("id", true), data_type: "INTEGER" }, column("name")],
       primaryKeys: ["id"],
     })),
     onExecuteSql: computed(() => undefined),
@@ -191,7 +194,7 @@ function createQuickEntryEditor(options: {
   return editor;
 }
 
-function createPeopleGridEditor(result = computed(() => ({ columns: ["id", "name"], rows: [[1, "Ada"] as CellValue[]] }))) {
+function createPeopleGridEditor(result = computed(() => ({ columns: ["id", "name"], rows: [[1, "Ada"] as CellValue[]] })), connectionId?: string) {
   const rowStatusFilter = ref<RowStatusFilter>("all");
   let editor: ReturnType<typeof useDataGridEditor>;
 
@@ -199,7 +202,7 @@ function createPeopleGridEditor(result = computed(() => ({ columns: ["id", "name
     result,
     editable: computed(() => true),
     databaseType: computed(() => "postgres"),
-    connectionId: computed(() => undefined),
+    connectionId: computed(() => connectionId),
     database: computed(() => undefined),
     tableMeta: computed(() => ({
       tableName: "people",
@@ -249,6 +252,33 @@ function createPeopleGridEditor(result = computed(() => ({ columns: ["id", "name
 
   return editor;
 }
+
+test("data grid save forwards the GBase 8s driver profile", async () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+  useConnectionStore().addEphemeralConnection({
+    id: "gbase8s-1",
+    name: "GBase 8s",
+    db_type: "informix",
+    driver_profile: "gbase8s",
+    host: "localhost",
+    port: 9088,
+    username: "gbasedbt",
+    password: "",
+  });
+  let requestBody: Record<string, unknown> | undefined;
+  globalThis.fetch = (async (input, init) => {
+    if (String(input) !== "/api/query/prepare-data-grid-save") return new Response("unexpected request", { status: 500 });
+    requestBody = JSON.parse(String(init?.body ?? "{}"));
+    return Response.json({ statements: [], rollbackStatements: [] });
+  }) as typeof fetch;
+
+  const editor = createPeopleGridEditor(undefined, "gbase8s-1");
+  editor.applyCellValue(0, 1, "Grace");
+  await editor.previewChanges();
+
+  assert.equal(requestBody?.driverProfile, "gbase8s");
+});
 
 test("row data helper reuses unchanged rows and clones dirty rows only", () => {
   setActivePinia(createPinia());
@@ -374,6 +404,48 @@ test("cloning a row copies non-generated primary key values without executing sa
 
   assert.equal(saveCalls, 1);
   assert.deepEqual(editor.newRows.value, []);
+});
+
+test("cloning a row preserves its source and edited columns for custom saves", async () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+
+  let savedMeta: Array<{ sourceIndex?: number; editedColumns?: number[] }> | undefined;
+  const editor = createQuickEntryEditor({
+    quickEntryEnabled: false,
+    save: async (changes) => {
+      savedMeta = changes.newRowMeta;
+    },
+  });
+
+  editor.cloneRow(0);
+  assert.equal(editor.newRowMeta.value[0]?.sourceIndex, 0);
+  assert.deepEqual(editor.newRowMeta.value[0]?.editedColumns, undefined);
+
+  editor.applyCellValue(-1, 1, "Grace");
+  assert.deepEqual(editor.newRowMeta.value[0]?.editedColumns, [1]);
+
+  await editor.saveChanges();
+  assert.deepEqual(savedMeta, [
+    {
+      token: 1,
+      placement: null,
+      sourceIndex: 0,
+      editedColumns: [1],
+    },
+  ]);
+});
+
+test("cloning an edited source row marks its pending changes as explicit", () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+
+  const editor = createQuickEntryEditor({ quickEntryEnabled: false });
+  editor.applyCellValue(0, 1, "Lin");
+  editor.cloneRow(0);
+
+  assert.deepEqual(editor.newRows.value, [[1, "Lin"]]);
+  assert.deepEqual(editor.newRowMeta.value[0]?.editedColumns, [1]);
 });
 
 test("cloning a row clears auto-generated key columns", async () => {
@@ -586,6 +658,50 @@ test("saving inserted rows reloads current table data", async () => {
 
   assert.deepEqual(executedSql, [`INSERT INTO "public"."people" ("id", "name") VALUES (2, 'Linus');`]);
   assert.deepEqual(emitted, [["reload", "SELECT id, name FROM people", "linus", "name ILIKE '%l%'", "id DESC", 50, 50]]);
+});
+
+test("saving a DISTINCT joined-source insert targets only the bound Dameng table columns", async () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+
+  const result = computed(() => ({
+    columns: ["TASK_ID", "TASK_ENT_ID", "NAME", "ROW_LABEL"],
+    rows: [[1, 10, "before", "computed"] as CellValue[]],
+  }));
+  const executedSql: string[] = [];
+  const editor = useDataGridEditor({
+    result,
+    editable: computed(() => true),
+    databaseType: computed(() => "dameng"),
+    connectionId: computed(() => undefined),
+    database: computed(() => undefined),
+    tableMeta: computed(() => ({
+      schema: "SYSDBA",
+      tableName: "TASK_CHECK_ENT",
+      columns: [column("TASK_ID", true), column("TASK_ENT_ID"), column("NAME")],
+      primaryKeys: ["TASK_ID"],
+    })),
+    sourceColumns: computed(() => ["TASK_ID", "TASK_ENT_ID", "NAME", undefined]),
+    onExecuteSql: computed(() => async (sql: string) => {
+      executedSql.push(sql);
+    }),
+    customSaveHandler: computed(() => undefined),
+    sql: computed(() => "SELECT DISTINCT t4.* FROM TASK_CHECK_BASE t1 LEFT JOIN TASK_CHECK_ENT t4 ON t1.TASK_ID = t4.TASK_ID"),
+    searchText: ref(""),
+    whereFilterInput: ref(""),
+    orderByInput: ref(""),
+    currentWhereInput: computed(() => undefined),
+    rowStatusFilter: ref<"all" | "changed" | "edited" | "new" | "deleted">("all"),
+    pageSize: ref(50),
+    currentPage: ref(1),
+    getRowItem: () => undefined,
+    emit: () => {},
+  });
+
+  editor.newRows.value = [[2, 20, "grid-insert", "ignored expression"]];
+  await editor.saveChanges();
+
+  assert.deepEqual(executedSql, [`INSERT INTO "SYSDBA"."TASK_CHECK_ENT" ("TASK_ID", "TASK_ENT_ID", "NAME") VALUES (2, 20, 'grid-insert');`]);
 });
 
 test("saving edited rows without deletes does not reload table data", async () => {
@@ -878,6 +994,159 @@ test("undo and redo cover row add and delete operations", () => {
   assert.equal(editor.newRows.value.length, 1);
   editor.redoPendingChange();
   assert.deepEqual([...editor.deletedRows.value], [0]);
+});
+
+test("addRows appends the requested number of blank draft rows as one undoable change", () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+
+  const editor = createPeopleGridEditor();
+
+  editor.addRows(3);
+  assert.equal(editor.newRows.value.length, 3);
+  assert.deepEqual(editor.newRows.value, [
+    [null, null],
+    [null, null],
+    [null, null],
+  ]);
+
+  editor.undoPendingChange();
+  assert.equal(editor.newRows.value.length, 0);
+  editor.redoPendingChange();
+  assert.equal(editor.newRows.value.length, 3);
+});
+
+test("addRows appends after existing draft rows", () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+
+  const editor = createPeopleGridEditor();
+  editor.addRow();
+  editor.addRows(2);
+  assert.equal(editor.newRows.value.length, 3);
+});
+
+test("addRows ignores invalid counts", () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+
+  const editor = createPeopleGridEditor();
+  editor.addRows(0);
+  editor.addRows(-5);
+  editor.addRows(1.5);
+  editor.addRows(Number.NaN);
+  assert.equal(editor.newRows.value.length, 0);
+  assert.equal(editor.canUndoPendingChange.value, false);
+});
+
+test("addRows clamps counts above the batch limit", () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+
+  const editor = createPeopleGridEditor();
+  editor.addRows(DATA_GRID_MAX_BATCH_INSERT_ROWS + 100);
+  assert.equal(editor.newRows.value.length, DATA_GRID_MAX_BATCH_INSERT_ROWS);
+});
+
+test("addRows records the display placement alongside the pending rows", () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+
+  const editor = createPeopleGridEditor();
+  const firstId = editor.addRows(2, { anchorId: 0, position: "below" });
+  assert.equal(firstId, -1);
+  assert.equal(editor.newRowMeta.value.length, 2);
+  assert.deepEqual(
+    editor.newRowMeta.value.map((meta) => meta.placement),
+    [
+      { anchorId: 0, position: "below" },
+      { anchorId: 0, position: "below" },
+    ],
+  );
+  // Stable tokens are unique and monotonic.
+  assert.equal(editor.newRowMeta.value[0].token, 1);
+  assert.equal(editor.newRowMeta.value[1].token, 2);
+});
+
+test("addRows with a null placement appends at the end", () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+
+  const editor = createPeopleGridEditor();
+  editor.addRows(2, null);
+  assert.deepEqual(
+    editor.newRowMeta.value.map((meta) => meta.placement),
+    [null, null],
+  );
+});
+
+test("addRows can anchor to another pending row by its token", () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+
+  const editor = createPeopleGridEditor();
+  editor.addRows(1);
+  const firstToken = editor.newRowMeta.value[0].token;
+  editor.addRows(1, { anchorId: -firstToken, position: "below" });
+  assert.deepEqual(editor.newRowMeta.value[1].placement, { anchorId: -firstToken, position: "below" });
+});
+
+test("undo and redo restore the placement metadata", () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+
+  const editor = createPeopleGridEditor();
+  editor.addRows(2, { anchorId: 0, position: "above" });
+  editor.undoPendingChange();
+  assert.equal(editor.newRows.value.length, 0);
+  assert.equal(editor.newRowMeta.value.length, 0);
+  editor.redoPendingChange();
+  assert.equal(editor.newRows.value.length, 2);
+  assert.deepEqual(
+    editor.newRowMeta.value.map((meta) => meta.placement),
+    [
+      { anchorId: 0, position: "above" },
+      { anchorId: 0, position: "above" },
+    ],
+  );
+});
+
+test("deleting a pending row keeps the placement metadata aligned", () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+
+  const editor = createPeopleGridEditor();
+  editor.addRows(3);
+  editor.applyDeleteRow(-1);
+  assert.equal(editor.newRows.value.length, 2);
+  assert.equal(editor.newRowMeta.value.length, 2);
+});
+
+test("restoring a cached snapshot resumes token allocation past restored tokens", () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+  const firstEditor = createQuickEntryEditor({ quickEntryEnabled: true, cacheKey: "token-restore" });
+
+  firstEditor.addRows(2);
+  assert.deepEqual(
+    firstEditor.newRowMeta.value.map((m) => m.token),
+    [1, 2],
+  );
+  firstEditor.savePendingSnapshot(false, false);
+
+  const restoredEditor = createQuickEntryEditor({ quickEntryEnabled: true, cacheKey: "token-restore" });
+  assert.deepEqual(
+    restoredEditor.newRowMeta.value.map((m) => m.token),
+    [1, 2],
+  );
+
+  restoredEditor.addRows(1);
+  // The fresh instance restarts the allocator at 1; it must resume past the
+  // restored tokens so a new row never shares a token with a restored row.
+  assert.deepEqual(
+    restoredEditor.newRowMeta.value.map((m) => m.token),
+    [1, 2, 3],
+  );
 });
 
 test("batch row delete records a single undo snapshot", () => {
@@ -1825,7 +2094,7 @@ test("custom save handler without insert support keeps pending new rows", async 
   await editor.saveChanges();
 
   assert.equal(saveCalls, 0);
-  assert.equal(editor.saveError.value, "当前保存目标不支持新增行。");
+  assert.equal(editor.saveError.value, "The current save target does not support adding rows.");
   assert.deepEqual(editor.newRows.value, [[null, "Grace"]]);
   assert.equal(editor.hasPendingChanges.value, true);
 });
@@ -1849,7 +2118,7 @@ test("quick entry draft row pasted values become a new row and save once", async
   await Promise.resolve();
 
   assert.equal(saveCalls, 1);
-  assert.deepEqual(savedNewRows, [[["2", "Grace"]]]);
+  assert.deepEqual(savedNewRows, [[[2, "Grace"]]]);
   assert.deepEqual(editor.newRows.value, []);
   assert.deepEqual(editor.quickEntryDraftRow.value, [null, null]);
   assert.equal(editor.saveError.value, "");

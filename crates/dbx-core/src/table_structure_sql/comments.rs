@@ -20,10 +20,14 @@ pub(super) fn build_table_comment_sql(options: &TableStructureSqlOptions, warnin
     let table = qualified_table(dialect, options.schema.as_deref(), &options.table_name);
     let quoted = quote_string(&clean(new_comment));
     match dialect {
-        StructureDialect::Mysql => {
+        StructureDialect::Mysql | StructureDialect::GaussdbM => {
             vec![format!("ALTER TABLE {table} COMMENT = {quoted};")]
         }
-        StructureDialect::Postgres | StructureDialect::Oracle | StructureDialect::Dameng | StructureDialect::H2 => {
+        StructureDialect::Postgres
+        | StructureDialect::Oracle
+        | StructureDialect::Dameng
+        | StructureDialect::Oscar
+        | StructureDialect::H2 => {
             vec![format!("COMMENT ON TABLE {table} IS {quoted};")]
         }
         StructureDialect::ClickHouse => {

@@ -1,5 +1,5 @@
-import type { NacosConfigHistoryItem, NacosConfigItem, NacosConfigKey, NacosContentMatch, NacosImplementation, NacosInstanceInfo, NacosRawRequest, NacosServiceInfo, NacosVersionMode } from "@/types/nacos";
-import { diffChars, diffLines } from "diff";
+import type { NacosApiPlane, NacosConfigHistoryItem, NacosConfigItem, NacosConfigKey, NacosContentMatch, NacosImplementation, NacosInstanceInfo, NacosPermissionInfo, NacosRawRequest, NacosServiceInfo, NacosVersionMode } from "@/types/nacos";
+import { diffArrays, diffChars } from "diff";
 
 export type NacosRawTemplateKey = "serverState" | "namespaceList" | "configDetail" | "serviceList" | "instanceList";
 
@@ -12,26 +12,26 @@ export interface NacosRawTemplate {
 }
 
 export const NACOS_RAW_TEMPLATES: NacosRawTemplate[] = [
-  { key: "serverState", method: "GET", path: "/v3/console/server/state", query: "", body: "" },
-  { key: "namespaceList", method: "GET", path: "/v3/console/core/namespace/list", query: "", body: "" },
+  { key: "serverState", method: "GET", path: "/v3/admin/core/state", query: "", body: "" },
+  { key: "namespaceList", method: "GET", path: "/v3/admin/core/namespace/list", query: "", body: "" },
   {
     key: "configDetail",
     method: "GET",
-    path: "/v3/console/cs/config",
+    path: "/v3/admin/cs/config",
     query: "dataId=application.yaml&groupName=DEFAULT_GROUP&namespaceId=",
     body: "",
   },
   {
     key: "serviceList",
     method: "GET",
-    path: "/v3/console/ns/service/list",
+    path: "/v3/admin/ns/service/list",
     query: "pageNo=1&pageSize=20&namespaceId=",
     body: "",
   },
   {
     key: "instanceList",
     method: "GET",
-    path: "/v3/console/ns/instance/list",
+    path: "/v3/admin/ns/instance/list",
     query: "serviceName=DEFAULT_GROUP@@example&namespaceId=",
     body: "",
   },
@@ -58,6 +58,7 @@ export interface NacosEndpointNormalization {
 export interface NacosEndpointNormalizationOptions {
   implementation?: NacosImplementation;
   versionMode?: NacosVersionMode;
+  apiPlane?: NacosApiPlane;
   contextPath?: string;
 }
 
@@ -78,6 +79,7 @@ export function normalizeNacosEndpoint(input: string, options: NacosEndpointNorm
   const rawPath = url.pathname.replace(/\/+$/, "");
   const implementation = options.implementation;
   const versionMode = options.versionMode || "auto";
+  const apiPlane = options.apiPlane || "admin";
   const warnings: string[] = [];
   const hasRNacosSuffix = /\/rnacos$/i.test(rawPath);
   const hasNacosSuffix = /\/nacos$/i.test(rawPath);
@@ -91,9 +93,10 @@ export function normalizeNacosEndpoint(input: string, options: NacosEndpointNorm
     contextPath = hasNacosSuffix ? rawPath : options.contextPath?.trim() || "/nacos";
   } else if (detectedVersion === "v3" || hasNacos3UiSuffix) {
     contextPath = rawPath.replace(/\/(?:next(?:\/index\.html)?|index\.html)$/i, "");
+    if (!contextPath) contextPath = options.contextPath?.trim() || (apiPlane === "console" ? "" : "/nacos");
     if (hasNacos3UiSuffix) warnings.push("The Nacos 3 console route was removed from the API context.");
   } else if (!contextPath) {
-    contextPath = options.contextPath?.trim() || (detectedVersion === "v2" ? "/nacos" : "");
+    contextPath = options.contextPath?.trim() || (versionMode === "v2" ? "/nacos" : "");
   }
   url.pathname = "/";
   url.search = "";
@@ -105,6 +108,27 @@ export function normalizeNacosEndpoint(input: string, options: NacosEndpointNorm
     detectedVersion,
     warnings,
   };
+}
+
+export function normalizeNacosMetricsUrl(input: string): string {
+  const value = input.trim();
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("Nacos Prometheus metrics URL must be a valid absolute URL");
+  }
+  if (!["http:", "https:"].includes(url.protocol)) throw new Error("Nacos Prometheus metrics URL must use HTTP or HTTPS");
+  if (url.username || url.password) throw new Error("Nacos Prometheus metrics URL must not contain embedded credentials");
+  if (value.includes("#")) throw new Error("Nacos Prometheus metrics URL must not contain a fragment");
+  return url.toString();
+}
+
+export function nacosMetricsCandidates(serverAddr: string, contextPath: string, implementation: NacosImplementation): string[] {
+  const base = serverAddr.replace(/\/+$/, "");
+  const context = contextPath.replace(/\/+$/, "");
+  const raw = implementation === "rnacos" ? [`${base}/metrics`, `${base}${context}/metrics`, `${base}/rnacos/metrics`] : [`${base}${context}/actuator/prometheus`, `${base}/nacos/actuator/prometheus`, `${base}/actuator/prometheus`];
+  return [...new Set(raw.map((value) => new URL(value).toString()))];
 }
 
 /**
@@ -138,6 +162,43 @@ export function parseNacosRawQuery(text: string): Record<string, string> | undef
   const trimmed = text.trim().replace(/^\?/, "");
   if (!trimmed) return undefined;
   return Object.fromEntries(new URLSearchParams(trimmed).entries());
+}
+
+export function parseNacosManagedNamespaces(text: string): string[] {
+  return [
+    ...new Set(
+      text
+        .split(/[\n,，]+/)
+        .map((value) => value.trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+export type NacosNamespacePermissionAction = "r" | "w" | "rw";
+
+export interface NacosNamespacePermissionAssignment {
+  namespaceId: string;
+  action: NacosNamespacePermissionAction;
+}
+
+/**
+ * The Nacos permission table may store read and write as separate rows for the
+ * same role and namespace. The editor exposes one assignment per namespace, so
+ * combine those rows before populating the form to avoid dropping either half
+ * when an unchanged role is saved.
+ */
+export function mergeNacosNamespacePermissionAssignments(permissions: Pick<NacosPermissionInfo, "actionRaw" | "parsedScope">[]): NacosNamespacePermissionAssignment[] {
+  const assignments = new Map<string, NacosNamespacePermissionAction>();
+  for (const permission of permissions) {
+    const namespaceId = permission.parsedScope?.namespaceId;
+    if (!namespaceId || !["r", "w", "rw"].includes(permission.actionRaw)) continue;
+    const current = assignments.get(namespaceId);
+    const readable = current?.includes("r") || permission.actionRaw.includes("r");
+    const writable = current?.includes("w") || permission.actionRaw.includes("w");
+    assignments.set(namespaceId, readable && writable ? "rw" : readable ? "r" : "w");
+  }
+  return [...assignments].map(([namespaceId, action]) => ({ namespaceId, action }));
 }
 
 export function parseNacosRawBody(text: string): unknown {
@@ -480,32 +541,24 @@ export interface NacosInlineDiffRow {
 }
 
 export function summarizeNacosConfigDiff(before: string, after: string, maxPreviewLines = 40): NacosDiffSummary {
-  if (before === after) {
-    return { changed: false, addedLines: 0, removedLines: 0, preview: "No content changes." };
-  }
-  const beforeLines = before.split(/\r?\n/);
-  const afterLines = after.split(/\r?\n/);
-  const max = Math.max(beforeLines.length, afterLines.length);
+  const changes = diffArrays(splitDiffLines(before), splitDiffLines(after));
   const lines: string[] = [];
   let addedLines = 0;
   let removedLines = 0;
-  for (let index = 0; index < max; index += 1) {
-    const left = beforeLines[index];
-    const right = afterLines[index];
-    if (left === right) continue;
-    if (left !== undefined) {
-      removedLines += 1;
-      lines.push(`- ${left}`);
-    }
-    if (right !== undefined) {
-      addedLines += 1;
-      lines.push(`+ ${right}`);
-    }
-    if (lines.length >= maxPreviewLines) {
-      lines.push("...");
-      break;
+
+  for (const change of changes) {
+    if (!change.added && !change.removed) continue;
+    const prefix = change.added ? "+" : "-";
+    for (const line of change.value) {
+      if (change.added) addedLines += 1;
+      else removedLines += 1;
+      if (lines.length < maxPreviewLines) lines.push(`${prefix} ${line}`);
     }
   }
+
+  const changed = addedLines > 0 || removedLines > 0;
+  if (!changed) return { changed: false, addedLines: 0, removedLines: 0, preview: "No content changes." };
+  if (lines.length < addedLines + removedLines) lines.push("...");
   return { changed: true, addedLines, removedLines, preview: lines.join("\n") };
 }
 
@@ -559,7 +612,7 @@ function pairChangedLines(leftLines: string[], rightLines: string[], leftStart: 
 }
 
 export function buildNacosSideBySideDiff(before: string, after: string): NacosSideBySideDiffRow[] {
-  const changes = diffLines(normalizeNacosDiffText(before), normalizeNacosDiffText(after), { newlineIsToken: false });
+  const changes = diffArrays(splitDiffLines(before), splitDiffLines(after));
   const rows: NacosSideBySideDiffRow[] = [];
   let leftLineNumber = 1;
   let rightLineNumber = 1;
@@ -569,7 +622,7 @@ export function buildNacosSideBySideDiff(before: string, after: string): NacosSi
   for (let index = 0; index < changes.length; index += 1) {
     const change = changes[index];
     if (!change.added && !change.removed) {
-      for (const line of splitDiffLines(change.value)) {
+      for (const line of change.value) {
         rows.push({
           id: nextId(),
           leftLineNumber,
@@ -588,10 +641,10 @@ export function buildNacosSideBySideDiff(before: string, after: string): NacosSi
     }
 
     if (change.removed) {
-      const leftLines = splitDiffLines(change.value);
+      const leftLines = change.value;
       const next = changes[index + 1];
       if (next?.added) {
-        const rightLines = splitDiffLines(next.value);
+        const rightLines = next.value;
         pairChangedLines(leftLines, rightLines, leftLineNumber, rightLineNumber, rows, nextId);
         leftLineNumber += leftLines.length;
         rightLineNumber += rightLines.length;
@@ -604,7 +657,7 @@ export function buildNacosSideBySideDiff(before: string, after: string): NacosSi
     }
 
     if (change.added) {
-      const rightLines = splitDiffLines(change.value);
+      const rightLines = change.value;
       pairChangedLines([], rightLines, leftLineNumber, rightLineNumber, rows, nextId);
       rightLineNumber += rightLines.length;
     }
@@ -658,6 +711,24 @@ export function buildNacosConfigDeleteConfirm(item: NacosConfigItem, fallbackNam
   return formatNacosConfigIdentity(item, fallbackNamespace);
 }
 
+export function formatNacosHistoryTime(value?: string | null): string {
+  const trimmed = value?.trim();
+  if (!trimmed) return "-";
+  if (/^0+$/.test(trimmed)) return "-";
+  if (/^\d{10}(?:\d{3})?$/.test(trimmed)) {
+    const timestamp = Number(trimmed);
+    const date = new Date(trimmed.length === 10 ? timestamp * 1_000 : timestamp);
+    if (!Number.isNaN(date.getTime())) {
+      const datePart = [date.getFullYear(), date.getMonth() + 1, date.getDate()].map((part) => String(part).padStart(2, "0")).join("-");
+      const timePart = [date.getHours(), date.getMinutes(), date.getSeconds()].map((part) => String(part).padStart(2, "0")).join(":");
+      return `${datePart} ${timePart}`;
+    }
+  }
+  const match = trimmed.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$/);
+  if (!match) return trimmed;
+  return `${match[1]} ${match[2]}`;
+}
+
 export function buildNacosConfigHistoryRollbackConfirm(item: NacosConfigHistoryItem, fallbackNamespace = ""): string {
   return [`namespace=${item.namespace || fallbackNamespace || "public"}`, `dataId=${item.dataId}`, `group=${item.group || "DEFAULT_GROUP"}`, item.lastModifiedTime ? `historyTime=${item.lastModifiedTime}` : "", item.operator ? `operator=${item.operator}` : ""].filter(Boolean).join("\n");
 }
@@ -670,8 +741,12 @@ export function buildNacosInstanceConfirm(service: NacosServiceInfo, instance: N
     `serviceName=${service.serviceName}`,
     `group=${instance.groupName || service.groupName || fallbackGroup || "DEFAULT_GROUP"}`,
     `instance=${instance.ip}:${instance.port}`,
+    `cluster=${instance.clusterName || "DEFAULT"}`,
+    `ephemeral=${instance.ephemeral === true ? "true" : instance.ephemeral === false ? "false" : "unknown"}`,
     patch.enabled == null ? "" : `targetEnabled=${targetEnabled === false ? "false" : "true"}`,
     patch.healthy == null ? "" : `targetHealthy=${targetHealthy === false ? "false" : "true"}`,
+    patch.weight == null ? "" : `targetWeight=${patch.weight}`,
+    patch.metadata == null ? "" : `targetMetadata=${JSON.stringify(patch.metadata)}`,
   ]
     .filter(Boolean)
     .join("\n");

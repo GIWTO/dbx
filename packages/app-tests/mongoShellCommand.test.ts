@@ -7,13 +7,18 @@ import {
   mongoAggregateWriteStage,
   mongoCollectionStatsToQueryResult,
   mongoCountToQueryResult,
+  mongoDatabasesToQueryResult,
   mongoDistinctToQueryResult,
   mongoDocumentsToQueryResult,
+  mongoDroppedIndexesToQueryResult,
+  mongoFindLogicalTotal,
   mongoIndexesToQueryResult,
   normalizeRustMongoCommand,
   parseMongoAggregateCommand,
   parseMongoCollectionStatsCommand,
   parseMongoCommand,
+  parseMongoCreateUserCommand,
+  parseMongoRunCommand,
   parseMongoCountDocumentsCommand,
   parseMongoDistinctCommand,
   parseMongoFindCommand,
@@ -23,6 +28,7 @@ import {
   parseMongoFindOneAndDeleteCommand,
   parseMongoGetIndexesCommand,
   parseMongoVersionCommand,
+  planMongoFindPagination,
   parseMongoWriteCommand,
   splitMongoCommands,
   splitMongoCommandRanges,
@@ -46,6 +52,148 @@ test("normalizeRustMongoCommand preserves the desktop command contract", () => {
   assert.deepEqual(normalizeRustMongoCommand({ kind: "findOne", collection: "users", filter: "{}", projection: null, options: null }), { kind: "findOne", collection: "users", filter: "{}" });
 });
 
+test("parseMongoCreateUserCommand normalizes user and write concern documents", () => {
+  assert.deepEqual(
+    parseMongoCreateUserCommand(`db.createUser({
+      user: "test-db",
+      pwd: "test-password",
+      roles: [{ role: "readWrite", db: "db1" }]
+    }, { w: "majority", wtimeout: 5000 })`),
+    {
+      userJson: '{"user":"test-db","pwd":"test-password","roles":[{"role":"readWrite","db":"db1"}]}',
+      writeConcernJson: '{"w":"majority","wtimeout":5000}',
+    },
+  );
+  assert.equal(parseMongoCreateUserCommand('db.createUser({pwd: "missing-user", roles: []})'), null);
+  assert.equal(parseMongoCreateUserCommand('db.createUser({user: "test"}, "majority")'), null);
+});
+
+test("splitMongoCommands executes use before createUser", () => {
+  const commands = splitMongoCommands(`use admin
+
+db.createUser({
+  user: "test-db",
+  pwd: "test-password",
+  roles: [{ role: "readWrite", db: "db1" }]
+})`);
+
+  assert.deepEqual(
+    commands.map(({ command }) => command.kind),
+    ["use", "createUser"],
+  );
+  const createUser = commands[1]?.command;
+  assert.equal(createUser?.kind, "createUser");
+  if (createUser?.kind === "createUser") {
+    assert.equal(JSON.parse(createUser.userJson).user, "test-db");
+    assert.match(evaluateMongoWriteSafety(createUser, { allowWrites: true }).reason || "", /high-risk operations/i);
+    assert.equal(evaluateMongoWriteSafety(createUser, { allowWrites: true, allowDangerous: true }).allowed, true);
+  }
+});
+
+test("parseMongoRunCommand normalizes one non-empty command document", () => {
+  assert.deepEqual(
+    parseMongoRunCommand(`db.runCommand({
+      find: "orders",
+      filter: {_id: ObjectId("507f1f77bcf86cd799439011")},
+      createdAt: ISODate("2025-01-01T00:00:00Z")
+    })`),
+    {
+      commandJson: '{"find":"orders","filter":{"_id":{"$oid":"507f1f77bcf86cd799439011"}},"createdAt":{"$date":"2025-01-01T00:00:00Z"}}',
+    },
+  );
+
+  for (const source of ["db.runCommand()", "db.runCommand({})", "db.runCommand('ping')", "db.runCommand({ping: 1}, {readPreference: 'primary'})", "db.runCommand({ping: 1}).valueOf()", "db.runCommand([1, 2, 3])"]) {
+    assert.equal(parseMongoRunCommand(source), null, source);
+  }
+});
+
+test("parseMongoCommand accepts read-only show-databases aliases exactly", () => {
+  for (const source of ["show dbs", "SHOW DATABASES;", "/* databases */ show dbs -- list"]) {
+    assert.deepEqual(parseMongoCommand(source)?.command, { kind: "showDatabases" }, source);
+  }
+
+  for (const source of ["show dbs extra", "show database", "show collections", "show"]) {
+    assert.equal(parseMongoCommand(source), null, source);
+  }
+
+  assert.equal(evaluateMongoWriteSafety(parseMongoCommand("db.runCommand({listDatabases: 1})")!.command as MongoWriteCommand, {}).allowed, false);
+});
+
+test("splitMongoCommands keeps show databases after a database switch", () => {
+  assert.deepEqual(
+    splitMongoCommands("use app\nshow databases").map(({ command }) => command.kind),
+    ["use", "showDatabases"],
+  );
+});
+
+test("mongoDatabasesToQueryResult preserves metadata and bounds rows", () => {
+  assert.deepEqual(
+    mongoDatabasesToQueryResult(
+      [
+        {
+          databases: [
+            { name: "admin", sizeOnDisk: 40960, empty: false },
+            { name: "app", sizeOnDisk: { $numberLong: "8192" }, empty: true },
+            { name: "logs", sizeOnDisk: 1024, empty: false },
+          ],
+          totalSize: 50176,
+          ok: 1,
+        },
+      ],
+      4.4,
+      2,
+    ),
+    {
+      columns: ["name", "sizeOnDisk", "empty"],
+      rows: [
+        ["admin", 40960, false],
+        ["app", "8192", true],
+      ],
+      affected_rows: 3,
+      execution_time_ms: 4,
+      truncated: true,
+      has_more: true,
+    },
+  );
+
+  assert.deepEqual(mongoDatabasesToQueryResult([{ databases: [] }], 0, 10), {
+    columns: ["name", "sizeOnDisk", "empty"],
+    rows: [],
+    affected_rows: 0,
+    execution_time_ms: 0,
+    truncated: false,
+    has_more: false,
+  });
+  assert.throws(() => mongoDatabasesToQueryResult([{ ok: 1 }], 0, 10), /databases array/);
+});
+
+test("runCommand support does not accept arbitrary Mongo shell JavaScript", () => {
+  assert.deepEqual(
+    splitMongoCommands(`for (let i = 0; i < 2; i += 1) {
+  db.items.insertOne({ index: i });
+}`),
+    [],
+  );
+});
+
+test("splitMongoCommands keeps runCommand after a database switch", () => {
+  const commands = splitMongoCommands(`use admin
+
+db.runCommand({ ping: 1 })`);
+
+  assert.deepEqual(
+    commands.map(({ command }) => command.kind),
+    ["use", "runCommand"],
+  );
+  const runCommand = commands[1]?.command;
+  assert.equal(runCommand?.kind, "runCommand");
+  if (runCommand?.kind === "runCommand") {
+    assert.deepEqual(JSON.parse(runCommand.commandJson), { ping: 1 });
+    assert.equal(evaluateMongoWriteSafety(runCommand, { allowWrites: true }).allowed, false);
+    assert.equal(evaluateMongoWriteSafety(runCommand, { allowWrites: true, allowDangerous: true }).allowed, true);
+  }
+});
+
 test("parseMongoFindCommand parses getCollection find with chained sort skip and limit", () => {
   assert.deepEqual(parseMongoFindCommand('db.getCollection("audit.logs").find({"level":"warn"}).sort({"createdAt":-1}).skip(20).limit(10)'), {
     collection: "audit.logs",
@@ -54,6 +202,52 @@ test("parseMongoFindCommand parses getCollection find with chained sort skip and
     limit: 10,
     sort: '{"createdAt":-1}',
   });
+});
+
+test("parseMongoFindCommand preserves chained collation for execution and pagination", () => {
+  const command = parseMongoFindCommand(`db.t_user.find({name: 'xxx'})
+    .collation({ locale: "en", strength: 1 })
+    .limit(20)`);
+
+  assert.ok(command);
+  assert.equal(command.collection, "t_user");
+  assert.deepEqual(JSON.parse(command.filter), { name: "xxx" });
+  assert.deepEqual(JSON.parse(command.collation ?? "null"), { locale: "en", strength: 1 });
+  assert.equal(command.skip, 0);
+  assert.equal(command.limit, 20);
+});
+
+test("planMongoFindPagination pages unbounded find queries", () => {
+  const command = parseMongoFindCommand("db.users.find({})");
+  assert.ok(command);
+  const plan = planMongoFindPagination("db.users.find({})", command, 100, 100);
+
+  assert.deepEqual(plan, {
+    pageOffset: 100,
+    pageLimit: 100,
+    requestSkip: 100,
+    requestLimit: 100,
+    logicalSkip: 0,
+    logicalLimit: undefined,
+  });
+  assert.equal(mongoFindLogicalTotal(824, plan!), 824);
+});
+
+test("planMongoFindPagination preserves explicit skip and limit bounds", () => {
+  const source = "db.users.find({ active: true }).skip(20).limit(150)";
+  const command = parseMongoFindCommand(source);
+  assert.ok(command);
+  const plan = planMongoFindPagination(source, command, 100, 100);
+
+  assert.deepEqual(plan, {
+    pageOffset: 100,
+    pageLimit: 100,
+    requestSkip: 120,
+    requestLimit: 50,
+    logicalSkip: 20,
+    logicalLimit: 150,
+  });
+  assert.equal(mongoFindLogicalTotal(824, plan!), 150);
 });
 
 test("parseMongoFindCommand accepts line breaks before find and chained calls", () => {
@@ -1018,6 +1212,17 @@ test("mongoDocumentsToQueryResult keeps aligned extended documents for copying",
   assert.deepEqual(result.mongo_documents, documents);
   assert.deepEqual(result.mongo_copy_documents, copyDocuments);
   assert.equal(mongoDocumentsToQueryResult(documents, 5, 1, []).mongo_copy_documents, undefined);
+});
+
+test("mongoDroppedIndexesToQueryResult exposes partial failures", () => {
+  const result = mongoDroppedIndexesToQueryResult(["email_1"], 5, [{ name: "missing_1", message: "index not found" }]);
+
+  assert.deepEqual(result.columns, ["name", "status", "message"]);
+  assert.deepEqual(result.rows, [
+    ["email_1", "dropped", null],
+    ["missing_1", "failed", "index not found"],
+  ]);
+  assert.equal(result.affected_rows, 1);
 });
 
 test("mongoDocumentsToQueryResult preserves an inexact total marker", () => {

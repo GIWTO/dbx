@@ -7,6 +7,7 @@ import com.dbx.agent.MetadataListConstraints;
 import com.dbx.agent.ObjectInfo;
 import com.dbx.agent.ObjectSource;
 import com.dbx.agent.QueryPageOptions;
+import com.dbx.agent.QueryResult;
 import com.dbx.agent.TableInfo;
 import com.dbx.agent.test.TestSupport;
 import org.junit.jupiter.api.Assertions;
@@ -18,10 +19,15 @@ import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Statement;
+import java.sql.Types;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 
 class OceanBaseOracleAgentTest {
     @Test
@@ -66,6 +72,36 @@ class OceanBaseOracleAgentTest {
     }
 
     @Test
+    void schemaListingReturnsEveryNonBlankUserWithoutHardSystemExclusions() {
+        List<String> sql = new ArrayList<>();
+        OceanBaseOracleAgent agent = new OceanBaseOracleAgent();
+        TestSupport.setPrivateConnection(agent, schemaConnection(sql, resultSet(
+            new String[]{"USERNAME"},
+            new Object[][]{
+                {"SYS"},
+                {null},
+                {"   "},
+                {"APEX_240100"},
+                {"APP$USER"},
+                {"REPORTING"}
+            }
+        )));
+
+        Assertions.assertEquals(
+            List.of("SYS", "APEX_240100", "APP$USER", "REPORTING"),
+            agent.listSchemas()
+        );
+        String schemaSql = sql.get(0).toUpperCase(Locale.ROOT);
+        Assertions.assertTrue(schemaSql.contains("FROM ALL_USERS"), schemaSql);
+        Assertions.assertTrue(schemaSql.contains("USERNAME IS NOT NULL"), schemaSql);
+        Assertions.assertFalse(schemaSql.contains("NOT IN"), schemaSql);
+        Assertions.assertFalse(schemaSql.contains("USERNAME NOT LIKE"), schemaSql);
+        Assertions.assertTrue(schemaSql.contains("CURRENT_SCHEMA') THEN 0"), schemaSql);
+        Assertions.assertTrue(schemaSql.contains("SESSION_USER') THEN 1"), schemaSql);
+        Assertions.assertTrue(schemaSql.endsWith("ELSE 2\nEND, USERNAME"), schemaSql);
+    }
+
+    @Test
     void appendsCompatibleOjdbcVersionToCustomJdbcUrl() {
         ConnectParams params = new ConnectParams();
         params.setConnection_string("jdbc:oceanbase://custom-host:2881/sys?useSSL=false");
@@ -83,7 +119,7 @@ class OceanBaseOracleAgentTest {
             OceanBaseOracleAgent.queryTimeoutSql(300)
         );
         Assertions.assertEquals(
-            "ALTER SESSION SET ob_query_timeout = 0",
+            "ALTER SESSION SET ob_query_timeout = 3216672000000000",
             OceanBaseOracleAgent.queryTimeoutSql(0)
         );
         Assertions.assertEquals(
@@ -98,14 +134,69 @@ class OceanBaseOracleAgentTest {
     }
 
     @Test
+    void treatsZeroQueryTimeoutAsUnlimitedForOceanBaseSession() {
+        List<String> sql = new ArrayList<>();
+        List<Integer> queryTimeouts = new ArrayList<>();
+        OceanBaseOracleAgent agent = new OceanBaseOracleAgent();
+        Connection connection = executionConnection(sql, queryTimeouts, List.of());
+        TestSupport.setPrivateConnection(agent, connection);
+
+        agent.executeQuery("INSERT INTO ITEMS (ID) VALUES (1)", null, new ExecuteQueryOptions(10, null, 0));
+
+        Assertions.assertEquals(List.of(
+            "ALTER SESSION SET ob_query_timeout = 3216672000000000",
+            "INSERT INTO ITEMS (ID) VALUES (1)"
+        ), sql);
+        Assertions.assertEquals(List.of(), queryTimeouts);
+    }
+
+    @Test
     void synchronizesSessionTimeoutForEveryQueryEntryPoint() {
         List<String> sql = new ArrayList<>();
+        List<Integer> queryTimeouts = new ArrayList<>();
         OceanBaseOracleAgent agent = new OceanBaseOracleAgent();
-        TestSupport.setPrivateConnection(agent, executionConnection(sql));
+        Connection connection = executionConnection(sql, queryTimeouts, List.of());
+        TestSupport.setPrivateConnection(agent, connection);
 
         agent.executeQuery("SELECT 1 FROM DUAL", null, new ExecuteQueryOptions(10, null, 12));
         agent.executeQueryPage("SELECT 2 FROM DUAL", null, new QueryPageOptions(10, null, 10, 13));
         agent.startTableRead("SELECT 3 FROM DUAL", null, new QueryPageOptions(10, null, 10, 14));
+        Assertions.assertDoesNotThrow(() -> agent.beforePooledConnectionReturn(connection));
+
+        Assertions.assertEquals(List.of(
+            "ALTER SESSION SET ob_query_timeout = 12000000",
+            "SELECT 1 FROM DUAL",
+            "ALTER SESSION SET ob_query_timeout = 13000000",
+            "SELECT 2 FROM DUAL",
+            "ALTER SESSION SET ob_query_timeout = 14000000",
+            "SELECT 3 FROM DUAL",
+            "ALTER SESSION SET ob_query_timeout = 3216672000000000"
+        ), sql);
+        Assertions.assertEquals(List.of(12, 13, 14), queryTimeouts);
+    }
+
+    @Test
+    void executesEveryQueryEntryPointWhenSessionTimeoutIsRejectedAsReadOnly() {
+        SQLException sqlStateError = new SQLException("wrapped");
+        sqlStateError.setNextException(new SQLException("read only", "25006"));
+        SQLException vendorError = new SQLException("wrapped", new SQLException("read only", null, 1456));
+        SQLException messageError = new SQLException("wrapped", new SQLException(
+            "(conn=1) OBE-01456: may not perform insert/delete/update operation inside a READ ONLY transaction"
+        ));
+        List<String> sql = new ArrayList<>();
+        List<Integer> queryTimeouts = new ArrayList<>();
+        OceanBaseOracleAgent agent = new OceanBaseOracleAgent();
+        Connection connection = executionConnection(
+            sql,
+            queryTimeouts,
+            List.of(sqlStateError, vendorError, messageError)
+        );
+        TestSupport.setPrivateConnection(agent, connection);
+
+        agent.executeQuery("SELECT 1 FROM DUAL", null, new ExecuteQueryOptions(10, null, 12));
+        agent.executeQueryPage("SELECT 2 FROM DUAL", null, new QueryPageOptions(10, null, 10, 13));
+        agent.startTableRead("SELECT 3 FROM DUAL", null, new QueryPageOptions(10, null, 10, 14));
+        Assertions.assertDoesNotThrow(() -> agent.beforePooledConnectionReturn(connection));
 
         Assertions.assertEquals(List.of(
             "ALTER SESSION SET ob_query_timeout = 12000000",
@@ -115,6 +206,43 @@ class OceanBaseOracleAgentTest {
             "ALTER SESSION SET ob_query_timeout = 14000000",
             "SELECT 3 FROM DUAL"
         ), sql);
+        Assertions.assertEquals(List.of(12, 13, 14), queryTimeouts);
+    }
+
+    @Test
+    void rejectsUnrelatedSessionTimeoutErrorsBeforeExecutingQuery() {
+        SQLException alterError = new SQLException("insufficient privileges", "42000", 1031);
+        List<String> sql = new ArrayList<>();
+        List<Integer> queryTimeouts = new ArrayList<>();
+        OceanBaseOracleAgent agent = new OceanBaseOracleAgent();
+        TestSupport.setPrivateConnection(agent, executionConnection(sql, queryTimeouts, List.of(alterError)));
+
+        RuntimeException error = Assertions.assertThrows(
+            RuntimeException.class,
+            () -> agent.executeQuery("SELECT 1 FROM DUAL", null, new ExecuteQueryOptions(10, null, 12))
+        );
+
+        Assertions.assertSame(alterError, error.getCause());
+        Assertions.assertEquals(List.of("ALTER SESSION SET ob_query_timeout = 12000000"), sql);
+        Assertions.assertTrue(queryTimeouts.isEmpty());
+    }
+
+    @Test
+    void readsBlobValuesAsHexWithoutStringConversion() {
+        OceanBaseOracleAgent agent = new OceanBaseOracleAgent();
+        TestSupport.setPrivateConnection(agent, queryConnection(blobResultSet()));
+
+        QueryResult result = agent.executeQuery(
+            "SELECT PAYLOAD, EMPTY_PAYLOAD, DESCRIPTION FROM DOCUMENTS",
+            null,
+            new ExecuteQueryOptions(10, null, 5)
+        );
+
+        Assertions.assertEquals(List.of("PAYLOAD", "EMPTY_PAYLOAD", "DESCRIPTION"), result.getColumns());
+        Assertions.assertEquals(
+            List.of(Arrays.asList("0x012aff", null, "plain text")),
+            result.getRows()
+        );
     }
 
     @Test
@@ -346,6 +474,28 @@ class OceanBaseOracleAgentTest {
         });
     }
 
+    private static Connection schemaConnection(List<String> sql, ResultSet resultSet) {
+        Statement statement = proxy(Statement.class, (method, args) -> {
+            if ("executeQuery".equals(method.getName())) {
+                sql.add(String.valueOf(args[0]));
+                return resultSet;
+            }
+            if ("close".equals(method.getName())) {
+                return null;
+            }
+            return defaultValue(method.getReturnType());
+        });
+        return proxy(Connection.class, (method, args) -> {
+            if ("createStatement".equals(method.getName())) {
+                return statement;
+            }
+            if ("isClosed".equals(method.getName())) {
+                return false;
+            }
+            return defaultValue(method.getReturnType());
+        });
+    }
+
     private static Connection objectSourceConnection(List<String> sql, List<String> params, ResultSet resultSet) {
         PreparedStatement statement = objectSourceStatement(params, resultSet, false);
         return proxy(Connection.class, (method, args) -> {
@@ -395,16 +545,33 @@ class OceanBaseOracleAgentTest {
     }
 
     private static Connection executionConnection(List<String> sql) {
+        return executionConnection(sql, new ArrayList<>(), List.of());
+    }
+
+    private static Connection executionConnection(
+        List<String> sql,
+        List<Integer> queryTimeouts,
+        List<SQLException> alterFailures
+    ) {
+        int[] alterFailureIndex = {0};
         Statement statement = proxy(Statement.class, (method, args) -> {
             if ("execute".equals(method.getName())) {
-                sql.add(String.valueOf(args[0]));
+                String statementSql = String.valueOf(args[0]);
+                sql.add(statementSql);
+                if (statementSql.startsWith("ALTER SESSION") && alterFailureIndex[0] < alterFailures.size()) {
+                    throw alterFailures.get(alterFailureIndex[0]++);
+                }
                 return false;
             }
             if ("getUpdateCount".equals(method.getName())) {
                 return 0;
             }
+            if ("setQueryTimeout".equals(method.getName())) {
+                queryTimeouts.add(((Number) args[0]).intValue());
+                return null;
+            }
             if ("close".equals(method.getName()) || "setMaxRows".equals(method.getName())
-                || "setFetchSize".equals(method.getName()) || "setQueryTimeout".equals(method.getName())) {
+                || "setFetchSize".equals(method.getName())) {
                 return null;
             }
             return defaultValue(method.getReturnType());
@@ -417,6 +584,90 @@ class OceanBaseOracleAgentTest {
                 return false;
             }
             return defaultValue(method.getReturnType());
+        });
+    }
+
+    private static Connection queryConnection(ResultSet resultSet) {
+        Statement statement = proxy(Statement.class, (method, args) -> {
+            switch (method.getName()) {
+                case "execute":
+                    return !String.valueOf(args[0]).startsWith("ALTER SESSION");
+                case "getResultSet":
+                    return resultSet;
+                case "getUpdateCount":
+                    return 0;
+                case "close":
+                case "setMaxRows":
+                case "setFetchSize":
+                case "setQueryTimeout":
+                    return null;
+                default:
+                    return defaultValue(method.getReturnType());
+            }
+        });
+        return proxy(Connection.class, (method, args) -> {
+            if ("createStatement".equals(method.getName())) {
+                return statement;
+            }
+            if ("isClosed".equals(method.getName())) {
+                return false;
+            }
+            return defaultValue(method.getReturnType());
+        });
+    }
+
+    private static ResultSet blobResultSet() {
+        String[] columns = {"PAYLOAD", "EMPTY_PAYLOAD", "DESCRIPTION"};
+        int[] sqlTypes = {Types.BLOB, Types.BLOB, Types.VARCHAR};
+        String[] typeNames = {"BLOB", "BLOB", "VARCHAR2"};
+        int[] rowIndex = {-1};
+        boolean[] wasNull = {false};
+        ResultSetMetaData metadata = proxy(ResultSetMetaData.class, (method, args) -> {
+            switch (method.getName()) {
+                case "getColumnCount":
+                    return columns.length;
+                case "getColumnLabel":
+                    return columns[((Number) args[0]).intValue() - 1];
+                case "getColumnType":
+                    return sqlTypes[((Number) args[0]).intValue() - 1];
+                case "getColumnTypeName":
+                    return typeNames[((Number) args[0]).intValue() - 1];
+                default:
+                    return defaultValue(method.getReturnType());
+            }
+        });
+        return proxy(ResultSet.class, (method, args) -> {
+            switch (method.getName()) {
+                case "next":
+                    rowIndex[0] += 1;
+                    return rowIndex[0] == 0;
+                case "getMetaData":
+                    return metadata;
+                case "getBytes":
+                    int bytesColumn = ((Number) args[0]).intValue();
+                    if (bytesColumn == 1) {
+                        wasNull[0] = false;
+                        return new byte[]{0x01, 0x2A, (byte) 0xFF};
+                    }
+                    if (bytesColumn == 2) {
+                        wasNull[0] = true;
+                        return null;
+                    }
+                    throw new AssertionError("Text columns should not be read with getBytes");
+                case "getString":
+                    int stringColumn = ((Number) args[0]).intValue();
+                    if (stringColumn != 3) {
+                        throw new SQLFeatureNotSupportedException("ORA_BLOB.getString() is unsupported");
+                    }
+                    wasNull[0] = false;
+                    return "plain text";
+                case "wasNull":
+                    return wasNull[0];
+                case "close":
+                    return null;
+                default:
+                    return defaultValue(method.getReturnType());
+            }
         });
     }
 

@@ -7,8 +7,10 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
+import java.io.Reader;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.math.BigDecimal;
@@ -17,21 +19,26 @@ import java.net.URLClassLoader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.sql.Connection;
+import java.sql.Clob;
 import java.sql.DatabaseMetaData;
 import java.sql.Date;
 import java.sql.Driver;
 import java.sql.DriverManager;
 import java.sql.DriverPropertyInfo;
+import java.sql.ParameterMetaData;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.SQLClientInfoException;
 import java.sql.SQLFeatureNotSupportedException;
 import java.lang.reflect.Method;
 import java.sql.Statement;
 import java.sql.Time;
 import java.sql.Timestamp;
 import java.sql.Types;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.time.temporal.TemporalAccessor;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -45,6 +52,7 @@ import java.util.ServiceLoader;
 import java.util.Set;
 import java.util.UUID;
 import java.util.logging.Logger;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 public final class DbxJdbcPlugin {
@@ -54,6 +62,12 @@ public final class DbxJdbcPlugin {
     private static final String JDBCX_EXTENSION_WHITELIST_PROPERTY = "jdbcx.extension.whitelist";
     private static final String JDBCX_HIGH_PRIVILEGE_EXTENSIONS_OPT_IN = "-Ddbx.jdbcx.allowHighPrivilegeExtensions=";
     private static final String JDBCX_SAFE_EXTENSION_WHITELIST = "help,var,version";
+    private static final int PHOENIX_VARBINARY_ENCODED_TYPE = 9000;
+    private static final String PHOENIX_VARBINARY_ENCODED_TYPE_NAME = "VARBINARY_ENCODED";
+    private static final Pattern PHOENIX_SYSTEM_CATALOG_WILDCARD = Pattern.compile(
+        "^SELECT\\s+\\*\\s+FROM\\s+(?:SYSTEM|\\\"SYSTEM\\\")\\s*\\.\\s*(?:CATALOG|\\\"CATALOG\\\")$",
+        Pattern.CASE_INSENSITIVE
+    );
     private static final String[] DEFAULT_TABLE_TYPES = new String[] {
         "TABLE",
         "VIEW",
@@ -69,11 +83,16 @@ public final class DbxJdbcPlugin {
         false,
         false,
         false,
+        false,
+        null,
         StatementMaxRowsMode.READ_LOOP_ONLY
     );
     private static final JdbcDriverQuirks USE_CATALOG_QUIRKS = DEFAULT_QUIRKS.withUseCatalogFallbackSql(true);
+    private static final JdbcDriverQuirks HIVE_QUIRKS = USE_CATALOG_QUIRKS.withSchemasAsDatabasesFallback(true);
     private static final JdbcDriverQuirks KINGBASE_QUIRKS = DEFAULT_QUIRKS.withIgnoreCatalogForSchemaMetadata(true);
-    private static final JdbcDriverQuirks TAOS_QUIRKS = DEFAULT_QUIRKS.withPreferExecuteQueryForResultSetSql(true);
+    private static final JdbcDriverQuirks TAOS_QUIRKS = DEFAULT_QUIRKS
+        .withPreferExecuteQueryForResultSetSql(true)
+        .withDatabaseClientInfoProperty("dbname");
     private static final JdbcDriverQuirks YASHAN_QUIRKS = new JdbcDriverQuirks(
         true,
         true,
@@ -81,6 +100,8 @@ public final class DbxJdbcPlugin {
         false,
         false,
         false,
+        false,
+        null,
         StatementMaxRowsMode.APPLY_STATEMENT_MAX_ROWS
     );
     private static final JdbcDriverQuirks IRIS_QUIRKS = new JdbcDriverQuirks(
@@ -90,6 +111,8 @@ public final class DbxJdbcPlugin {
         false,
         false,
         false,
+        false,
+        null,
         StatementMaxRowsMode.READ_LOOP_ONLY
     );
     private static final JdbcDriverQuirks ORACLE_QUIRKS = new JdbcDriverQuirks(
@@ -99,6 +122,8 @@ public final class DbxJdbcPlugin {
         false,
         false,
         false,
+        false,
+        null,
         StatementMaxRowsMode.APPLY_STATEMENT_MAX_ROWS
     );
     private static final List<JdbcDriverQuirkRule> DRIVER_QUIRK_RULES = List.of(
@@ -106,18 +131,20 @@ public final class DbxJdbcPlugin {
         new JdbcDriverQuirkRule("jdbc:mariadb:", USE_CATALOG_QUIRKS),
         new JdbcDriverQuirkRule("jdbc:starrocks:", USE_CATALOG_QUIRKS),
         new JdbcDriverQuirkRule("jdbc:doris:", USE_CATALOG_QUIRKS),
-        new JdbcDriverQuirkRule("jdbc:hive2:", USE_CATALOG_QUIRKS),
+        new JdbcDriverQuirkRule("jdbc:hive2:", HIVE_QUIRKS),
         new JdbcDriverQuirkRule("jdbc:kingbase", KINGBASE_QUIRKS),
         new JdbcDriverQuirkRule("jdbc:yasdb:", YASHAN_QUIRKS),
         new JdbcDriverQuirkRule("jdbc:iris:", IRIS_QUIRKS),
         new JdbcDriverQuirkRule("jdbc:oracle:", ORACLE_QUIRKS),
         new JdbcDriverQuirkRule("jdbc:dm:", ORACLE_QUIRKS),
         new JdbcDriverQuirkRule("jdbc:taos:", TAOS_QUIRKS),
-        new JdbcDriverQuirkRule("jdbc:taos-ws:", TAOS_QUIRKS)
+        new JdbcDriverQuirkRule("jdbc:taos-ws:", TAOS_QUIRKS),
+        new JdbcDriverQuirkRule("jdbc:taos-rs:", TAOS_QUIRKS)
     );
     private static String registeredDriverKey = "";
     private static String sharedConnectionKey = "";
     private static Connection sharedConnection;
+    private static boolean manualTransactionActive;
     private static final Map<String, QuerySession> QUERY_SESSIONS = new HashMap<>();
 
     record JdbcDriverQuirks(
@@ -127,6 +154,8 @@ public final class DbxJdbcPlugin {
         boolean useCatalogFallbackSql,
         boolean ignoreCatalogForSchemaMetadata,
         boolean preferExecuteQueryForResultSetSql,
+        boolean schemasAsDatabasesFallback,
+        String databaseClientInfoProperty,
         StatementMaxRowsMode statementMaxRowsMode
     ) {
         JdbcDriverQuirks withUseCatalogFallbackSql(boolean value) {
@@ -137,6 +166,8 @@ public final class DbxJdbcPlugin {
                 value,
                 ignoreCatalogForSchemaMetadata,
                 preferExecuteQueryForResultSetSql,
+                schemasAsDatabasesFallback,
+                databaseClientInfoProperty,
                 statementMaxRowsMode
             );
         }
@@ -149,6 +180,8 @@ public final class DbxJdbcPlugin {
                 useCatalogFallbackSql,
                 value,
                 preferExecuteQueryForResultSetSql,
+                schemasAsDatabasesFallback,
+                databaseClientInfoProperty,
                 statementMaxRowsMode
             );
         }
@@ -160,6 +193,36 @@ public final class DbxJdbcPlugin {
                 caseInsensitiveSchemaMetadata,
                 useCatalogFallbackSql,
                 ignoreCatalogForSchemaMetadata,
+                value,
+                schemasAsDatabasesFallback,
+                databaseClientInfoProperty,
+                statementMaxRowsMode
+            );
+        }
+
+        JdbcDriverQuirks withSchemasAsDatabasesFallback(boolean value) {
+            return new JdbcDriverQuirks(
+                skipExecutionContext,
+                useOracleMetadata,
+                caseInsensitiveSchemaMetadata,
+                useCatalogFallbackSql,
+                ignoreCatalogForSchemaMetadata,
+                preferExecuteQueryForResultSetSql,
+                value,
+                databaseClientInfoProperty,
+                statementMaxRowsMode
+            );
+        }
+
+        JdbcDriverQuirks withDatabaseClientInfoProperty(String value) {
+            return new JdbcDriverQuirks(
+                skipExecutionContext,
+                useOracleMetadata,
+                caseInsensitiveSchemaMetadata,
+                useCatalogFallbackSql,
+                ignoreCatalogForSchemaMetadata,
+                preferExecuteQueryForResultSetSql,
+                schemasAsDatabasesFallback,
                 value,
                 statementMaxRowsMode
             );
@@ -288,8 +351,26 @@ public final class DbxJdbcPlugin {
                 optionalText(params, "schema"),
                 positiveInt(params, "maxRows", MAX_ROWS),
                 nonNegativeInt(params, "fetchSize", 0),
+                nonNegativeInt(params, "rowOffset", 0),
                 nonNegativeInt(params, "timeoutSecs", -1)
             );
+            case "beginManualTransaction", "begin_manual_transaction" -> beginManualTransaction(
+                connection,
+                optionalText(params, "database"),
+                optionalText(params, "schema")
+            );
+            case "executeInManualTransaction", "execute_in_manual_transaction" -> executeInManualTransaction(
+                connection,
+                requireText(params, "sql"),
+                optionalText(params, "database"),
+                optionalText(params, "schema"),
+                positiveInt(params, "maxRows", MAX_ROWS),
+                nonNegativeInt(params, "fetchSize", 0),
+                nonNegativeInt(params, "rowOffset", 0),
+                nonNegativeInt(params, "timeoutSecs", -1)
+            );
+            case "commitManualTransaction", "commit_manual_transaction" -> commitManualTransaction();
+            case "rollbackManualTransaction", "rollback_manual_transaction" -> rollbackManualTransaction();
             case "executeQueryPage", "execute_query_page" -> executeQueryPage(
                 connection,
                 requireText(params, "sql"),
@@ -399,6 +480,10 @@ public final class DbxJdbcPlugin {
         );
         putMetadataText(info, "driverName", metadata::getDriverName);
         putMetadataText(info, "driverVersion", metadata::getDriverVersion);
+        Boolean supportsTransactions = readMetadata(metadata::supportsTransactions);
+        if (supportsTransactions != null) {
+            info.put("supportsTransactions", supportsTransactions);
+        }
 
         Integer jdbcMajor = readMetadata(metadata::getJDBCMajorVersion);
         Integer jdbcMinor = readMetadata(metadata::getJDBCMinorVersion);
@@ -491,6 +576,7 @@ public final class DbxJdbcPlugin {
         }
         String key = connectionKey(connection);
         if (sharedConnection != null && key.equals(sharedConnectionKey) && !sharedConnection.isClosed()) {
+            configureOrdinaryAutoCommit(sharedConnection);
             return sharedConnection;
         }
         closeSharedConnection();
@@ -498,6 +584,7 @@ public final class DbxJdbcPlugin {
         JdbcUrlCredentials urlCredentials = extractJdbcUrlCredentials(url);
         url = urlCredentials.url;
         Properties properties = new Properties();
+        applyPhoenixUrlProperties(url, properties);
         String username = optionalText(connection, "username");
         String password = optionalText(connection, "password");
         if (username == null) {
@@ -513,14 +600,67 @@ public final class DbxJdbcPlugin {
             properties.setProperty("password", password);
         }
         applyConnectTimeout(connection, properties);
-        applyPagedFetchProperties(connection, url, properties);
         applyJdbcxExtensionSecurity(connection, url, properties);
         if (isOracleUrl(url)) {
             applyOracleProperties(connection, properties);
         }
         sharedConnection = DriverManager.getConnection(url, properties);
         sharedConnectionKey = key;
+        configureOrdinaryAutoCommit(sharedConnection);
         return sharedConnection;
+    }
+
+    private static void configureOrdinaryAutoCommit(Connection jdbcConnection) throws SQLException {
+        if (manualTransactionActive || hasActiveQuerySession(jdbcConnection) || jdbcConnection.getAutoCommit()) {
+            return;
+        }
+        jdbcConnection.setAutoCommit(true);
+    }
+
+    private static boolean hasActiveQuerySession(Connection jdbcConnection) {
+        return QUERY_SESSIONS.values().stream().anyMatch(session -> session.connection == jdbcConnection);
+    }
+
+    private static boolean isPhoenixConnection(JsonNode connection, String url) {
+        if (isPhoenixUrl(url)) {
+            return true;
+        }
+        String driverClass = optionalText(connection, "jdbc_driver_class");
+        return driverClass != null && driverClass.equalsIgnoreCase("org.apache.phoenix.jdbc.PhoenixDriver");
+    }
+
+    private static void applyPhoenixUrlProperties(String url, Properties properties) {
+        if (!isPhoenixDirectUrl(url)) {
+            return;
+        }
+        int propertiesStart = url.indexOf(';');
+        if (propertiesStart < 0) {
+            return;
+        }
+        // Phoenix builds its HBase client configuration from Driver.connect Properties,
+        // while arbitrary semicolon URL attributes are not merged into QueryServices.
+        for (String part : url.substring(propertiesStart + 1).split(";")) {
+            int equals = part.indexOf('=');
+            if (equals <= 0) {
+                continue;
+            }
+            String key = part.substring(0, equals).trim();
+            if (!key.isEmpty()) {
+                properties.setProperty(key, part.substring(equals + 1).trim());
+            }
+        }
+    }
+
+    private static boolean isPhoenixDirectUrl(String url) {
+        return isPhoenixUrl(url) && !urlMatchesPrefix(url, "jdbc:phoenix:thin:");
+    }
+
+    private static boolean isPhoenixUrl(String url) {
+        String prefix = "jdbc:phoenix";
+        if (url == null || !url.regionMatches(true, 0, prefix, 0, prefix.length())) {
+            return false;
+        }
+        return url.length() == prefix.length() || url.charAt(prefix.length()) == ':' || url.charAt(prefix.length()) == ';';
     }
 
     private static void applyJdbcxExtensionSecurity(JsonNode connection, String url, Properties properties) {
@@ -587,25 +727,6 @@ public final class DbxJdbcPlugin {
             normalized.equals("org.mariadb.jdbc.driver");
     }
 
-    private static void applyPagedFetchProperties(JsonNode connection, String url, Properties properties) {
-        if (!isMysqlConnection(connection, url) || jdbcUrlHasParameter(url, "useCursorFetch")) {
-            return;
-        }
-        properties.putIfAbsent("useCursorFetch", "true");
-    }
-
-    private static boolean isMysqlConnection(JsonNode connection, String url) {
-        if (urlMatchesPrefix(url, "jdbc:mysql:")) {
-            return true;
-        }
-        String driverClass = optionalText(connection, "jdbc_driver_class");
-        if (driverClass == null) {
-            return false;
-        }
-        String normalized = driverClass.toLowerCase(Locale.ROOT);
-        return normalized.equals("com.mysql.cj.jdbc.driver") || normalized.equals("com.mysql.jdbc.driver");
-    }
-
     private static boolean isPostgresConnection(JsonNode connection) {
         if (urlMatchesPrefix(jdbcUrl(connection), "jdbc:postgresql:")) {
             return true;
@@ -639,6 +760,37 @@ public final class DbxJdbcPlugin {
         }
     }
 
+    private static ZoneId tdengineTimestampZone(JsonNode connection, Connection jdbcConnection) {
+        String url = jdbcUrl(connection);
+        if (
+            !urlMatchesPrefix(url, "jdbc:taos:") &&
+            !urlMatchesPrefix(url, "jdbc:taos-ws:") &&
+            !urlMatchesPrefix(url, "jdbc:taos-rs:")
+        ) {
+            return null;
+        }
+        try (
+            Statement statement = jdbcConnection.createStatement();
+            ResultSet result = statement.executeQuery("SELECT timezone()")
+        ) {
+            return result.next() ? parseTdengineTimezone(result.getString(1)) : null;
+        } catch (SQLException | AbstractMethodError | UnsupportedOperationException ignored) {
+            return null;
+        }
+    }
+
+    static ZoneId parseTdengineTimezone(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        String name = value.trim().split("\\s+", 2)[0];
+        try {
+            return ZoneId.of(name);
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
     private static JsonNode executeQuery(
         JsonNode connection,
         String sql,
@@ -646,16 +798,34 @@ public final class DbxJdbcPlugin {
         String schema,
         int maxRows,
         int fetchSize,
+        int rowOffset,
+        int timeoutSecs
+    ) throws Exception {
+        Connection conn = openConnection(connection);
+        return executeQueryOnConnection(connection, conn, sql, database, schema, maxRows, fetchSize, rowOffset, timeoutSecs);
+    }
+
+    private static JsonNode executeQueryOnConnection(
+        JsonNode connection,
+        Connection conn,
+        String sql,
+        String database,
+        String schema,
+        int maxRows,
+        int fetchSize,
+        int rowOffset,
         int timeoutSecs
     ) throws Exception {
         long start = System.nanoTime();
-        Connection conn = openConnection(connection);
         applyExecutionContext(connection, conn, database, schema);
         JdbcDriverQuirks quirks = driverQuirks(connection);
+        boolean preserveOracleDateTime = isOracleUrl(jdbcUrl(connection));
+        ZoneId timestampZone = tdengineTimestampZone(connection, conn);
         try (Statement statement = conn.createStatement()) {
             applyStatementOptions(statement, maxRows, fetchSize, timeoutSecs, quirks);
             String trimmedSql = trimStatementSql(sql);
-            ExecutedStatement executed = executeStatementForResult(statement, trimmedSql, quirks);
+            String effectiveSql = rewritePhoenixSystemCatalogQuery(connection, conn, trimmedSql);
+            ExecutedStatement executed = executeStatementForResult(statement, effectiveSql, quirks);
             ObjectNode result = MAPPER.createObjectNode();
             ArrayNode columns = MAPPER.createArrayNode();
             ArrayNode rows = MAPPER.createArrayNode();
@@ -669,6 +839,10 @@ public final class DbxJdbcPlugin {
                         String label = meta.getColumnLabel(i);
                         columns.add(label == null || label.isBlank() ? meta.getColumnName(i) : label);
                     }
+                    for (int skipped = 0; skipped < rowOffset && rs.next(); skipped++) {
+                        // Caché/IRIS does not support SQL offset pagination; advance
+                        // the forward-only JDBC cursor before collecting this page.
+                    }
                     while (rs.next()) {
                         if (rows.size() >= maxRows) {
                             truncated = true;
@@ -676,7 +850,7 @@ public final class DbxJdbcPlugin {
                         }
                         ArrayNode row = MAPPER.createArrayNode();
                         for (int i = 1; i <= columnCount; i++) {
-                            row.add(MAPPER.valueToTree(readValue(rs, meta, i)));
+                            row.add(MAPPER.valueToTree(readValue(rs, meta, i, preserveOracleDateTime, timestampZone)));
                         }
                         rows.add(row);
                     }
@@ -692,6 +866,69 @@ public final class DbxJdbcPlugin {
         }
     }
 
+    private static ObjectNode beginManualTransaction(JsonNode connection, String database, String schema)
+        throws SQLException {
+        if (manualTransactionActive) {
+            throw new SQLException("A manual transaction is already active");
+        }
+        Connection conn = openConnection(connection);
+        DatabaseMetaData metadata = readMetadata(conn::getMetaData);
+        Boolean supportsTransactions = metadata == null ? null : readMetadata(metadata::supportsTransactions);
+        if (Boolean.FALSE.equals(supportsTransactions)) {
+            throw new SQLFeatureNotSupportedException("This JDBC driver does not support transactions");
+        }
+        applyExecutionContext(connection, conn, database, schema);
+        conn.setAutoCommit(false);
+        manualTransactionActive = true;
+        return okResult();
+    }
+
+    private static JsonNode executeInManualTransaction(
+        JsonNode connection,
+        String sql,
+        String database,
+        String schema,
+        int maxRows,
+        int fetchSize,
+        int rowOffset,
+        int timeoutSecs
+    ) throws Exception {
+        Connection conn = activeManualTransactionConnection(connection);
+        return executeQueryOnConnection(connection, conn, sql, database, schema, maxRows, fetchSize, rowOffset, timeoutSecs);
+    }
+
+    private static ObjectNode commitManualTransaction() throws SQLException {
+        Connection conn = activeManualTransactionConnection(null);
+        conn.commit();
+        conn.setAutoCommit(true);
+        manualTransactionActive = false;
+        return okResult();
+    }
+
+    private static ObjectNode rollbackManualTransaction() throws SQLException {
+        Connection conn = activeManualTransactionConnection(null);
+        conn.rollback();
+        conn.setAutoCommit(true);
+        manualTransactionActive = false;
+        return okResult();
+    }
+
+    private static Connection activeManualTransactionConnection(JsonNode connection) throws SQLException {
+        if (!manualTransactionActive || sharedConnection == null || sharedConnection.isClosed()) {
+            throw new SQLException("No manual transaction is active");
+        }
+        if (connection != null && !connectionKey(connection).equals(sharedConnectionKey)) {
+            throw new SQLException("The manual transaction belongs to a different JDBC connection");
+        }
+        return sharedConnection;
+    }
+
+    private static ObjectNode okResult() {
+        ObjectNode result = MAPPER.createObjectNode();
+        result.put("ok", true);
+        return result;
+    }
+
     private record ExecutedStatement(ResultSet resultSet, int updateCount) {
     }
 
@@ -705,6 +942,8 @@ public final class DbxJdbcPlugin {
         private final long startNanos;
         private final Connection connection;
         private final boolean restoreAutoCommit;
+        private final boolean preserveOracleDateTime;
+        private final ZoneId timestampZone;
         private int rowsReturned;
         private ArrayNode pendingRow;
 
@@ -717,7 +956,9 @@ public final class DbxJdbcPlugin {
             int maxRows,
             long startNanos,
             Connection connection,
-            boolean restoreAutoCommit
+            boolean restoreAutoCommit,
+            boolean preserveOracleDateTime,
+            ZoneId timestampZone
         ) {
             this.id = id;
             this.statement = statement;
@@ -728,6 +969,8 @@ public final class DbxJdbcPlugin {
             this.startNanos = startNanos;
             this.connection = connection;
             this.restoreAutoCommit = restoreAutoCommit;
+            this.preserveOracleDateTime = preserveOracleDateTime;
+            this.timestampZone = timestampZone;
         }
     }
 
@@ -745,6 +988,8 @@ public final class DbxJdbcPlugin {
         Connection conn = openConnection(connection);
         applyExecutionContext(connection, conn, database, schema);
         JdbcDriverQuirks quirks = driverQuirks(connection);
+        boolean preserveOracleDateTime = isOracleUrl(jdbcUrl(connection));
+        ZoneId timestampZone = tdengineTimestampZone(connection, conn);
         boolean restoreAutoCommit = beginPagedQueryTransaction(connection, conn);
         Statement statement;
         try {
@@ -756,7 +1001,8 @@ public final class DbxJdbcPlugin {
         try {
             applyStatementOptions(statement, maxRows, fetchSize, timeoutSecs, quirks);
             String trimmedSql = trimStatementSql(sql);
-            ExecutedStatement executed = executeStatementForResult(statement, trimmedSql, quirks);
+            String effectiveSql = rewritePhoenixSystemCatalogQuery(connection, conn, trimmedSql);
+            ExecutedStatement executed = executeStatementForResult(statement, effectiveSql, quirks);
             ResultSet rs = executed.resultSet();
             if (rs == null) {
                 ObjectNode result = MAPPER.createObjectNode();
@@ -789,7 +1035,9 @@ public final class DbxJdbcPlugin {
                 maxRows,
                 start,
                 conn,
-                restoreAutoCommit
+                restoreAutoCommit,
+                preserveOracleDateTime,
+                timestampZone
             );
             QUERY_SESSIONS.put(sessionId, session);
             try {
@@ -862,7 +1110,7 @@ public final class DbxJdbcPlugin {
                     closeQuerySession(session.id);
                     return queryPageResult(session, rows, false, false);
                 }
-                row = readRow(session.resultSet, session.meta);
+                row = readRow(session.resultSet, session.meta, session.preserveOracleDateTime, session.timestampZone);
             }
             rows.add(row);
             session.rowsReturned++;
@@ -880,7 +1128,7 @@ public final class DbxJdbcPlugin {
             return queryPageResult(session, rows, false, false);
         }
 
-        session.pendingRow = readRow(session.resultSet, session.meta);
+        session.pendingRow = readRow(session.resultSet, session.meta, session.preserveOracleDateTime, session.timestampZone);
         return queryPageResult(session, rows, false, true);
     }
 
@@ -930,10 +1178,15 @@ public final class DbxJdbcPlugin {
         }
     }
 
-    private static ArrayNode readRow(ResultSet rs, ResultSetMetaData meta) throws SQLException {
+    private static ArrayNode readRow(
+        ResultSet rs,
+        ResultSetMetaData meta,
+        boolean preserveOracleDateTime,
+        ZoneId timestampZone
+    ) throws SQLException {
         ArrayNode row = MAPPER.createArrayNode();
         for (int i = 1; i <= meta.getColumnCount(); i++) {
-            row.add(MAPPER.valueToTree(readValue(rs, meta, i)));
+            row.add(MAPPER.valueToTree(readValue(rs, meta, i, preserveOracleDateTime, timestampZone)));
         }
         return row;
     }
@@ -1027,6 +1280,11 @@ public final class DbxJdbcPlugin {
         String planText = null;
         String dmMethod = null;
 
+        if (!autotrace && isOracleConnection(connection)) {
+            planText = getOracleExplainInfo(conn, sql, timeoutSecs);
+            dmMethod = "oracle-plan-table";
+        }
+
         if (autotrace) {
             if (!isSafeAutotraceSql(sql)) {
                 throw new IllegalArgumentException("unsafe");
@@ -1069,7 +1327,7 @@ public final class DbxJdbcPlugin {
                     } catch (Exception ignored) {}
                 }
             }
-        } else {
+        } else if (planText == null) {
             // ── Explain mode: direct plan via getExplainInfo(sqlStr), no execution ──
             try {
                 Class<?> dmConnClass = Class.forName("dm.jdbc.driver.DmdbConnection");
@@ -1102,6 +1360,206 @@ public final class DbxJdbcPlugin {
         result.put("has_actual_stats", "getExplainInfo(stmt)".equals(dmMethod));
         result.put("mode", autotrace ? "autotrace" : "explain");
         return result;
+    }
+
+    private static boolean isOracleConnection(JsonNode connection) {
+        String url = optionalText(connection, "connection_string");
+        return url != null && url.regionMatches(true, 0, "jdbc:oracle:", 0, "jdbc:oracle:".length());
+    }
+
+    private static String getOracleExplainInfo(Connection connection, String sql, int timeoutSecs) throws SQLException {
+        String statementId = "DBX_" + UUID.randomUUID().toString().replace("-", "").substring(0, 26);
+        String statementSql = trimStatementSql(sql);
+        StringBuilder plan = new StringBuilder();
+        try {
+            try (PreparedStatement explain = connection.prepareStatement(
+                "EXPLAIN PLAN SET STATEMENT_ID = '" + statementId + "' FOR " + statementSql
+            )) {
+                applyExplainTimeout(explain, timeoutSecs);
+                nullBindExplainParameters(explain, statementSql);
+                explain.execute();
+            }
+            try (PreparedStatement read = connection.prepareStatement(
+                "SELECT PLAN_TABLE_OUTPUT FROM TABLE(DBMS_XPLAN.DISPLAY('PLAN_TABLE', ?, 'TYPICAL +PREDICATE'))"
+            )) {
+                applyExplainTimeout(read, timeoutSecs);
+                read.setString(1, statementId);
+                try (ResultSet rows = read.executeQuery()) {
+                    while (rows.next()) {
+                        if (plan.length() > 0) plan.append('\n');
+                        plan.append(rows.getString(1));
+                    }
+                }
+            }
+            return plan.toString();
+        } finally {
+            try (PreparedStatement cleanup = connection.prepareStatement(
+                "DELETE FROM PLAN_TABLE WHERE STATEMENT_ID = ?"
+            )) {
+                applyExplainTimeout(cleanup, timeoutSecs);
+                cleanup.setString(1, statementId);
+                cleanup.executeUpdate();
+            } catch (SQLException ignored) {}
+        }
+    }
+
+    /**
+     * SQL passed to EXPLAIN PLAN may legitimately contain Oracle bind markers
+     * (":1", ":name", or "?") that aren't meant to be executed with real
+     * values — e.g. statements copied from V$SQL/AWR reports. A PreparedStatement
+     * still requires every marker to be bound before execute(), or Oracle throws
+     * "ORA-17041: Missing IN or OUT parameter". The plan doesn't depend on the
+     * actual bind values, so null them all out.
+     */
+    private static void nullBindExplainParameters(PreparedStatement statement, String sql) throws SQLException {
+        int parameterCount = -1;
+        try {
+            ParameterMetaData metadata = statement.getParameterMetaData();
+            if (metadata != null) {
+                parameterCount = metadata.getParameterCount();
+            }
+        } catch (SQLException ignored) {
+        }
+        if (parameterCount < 0) {
+            parameterCount = oracleExplainBindMarkerCount(sql);
+        }
+        for (int index = 1; index <= parameterCount; index++) {
+            statement.setNull(index, Types.VARCHAR);
+        }
+    }
+
+    private static int oracleExplainBindMarkerCount(String sql) {
+        int count = 0;
+        for (int index = 0; index < sql.length(); index++) {
+            char ch = sql.charAt(index);
+            if (ch == '\'') {
+                index = skipSingleQuotedSql(sql, index);
+            } else if (ch == '"') {
+                index = skipDoubleQuotedSql(sql, index);
+            } else if (ch == 'q' || ch == 'Q') {
+                int end = skipOracleAlternativeQuotedSql(sql, index);
+                if (end != index) {
+                    index = end;
+                }
+            } else if (ch == '-' && index + 1 < sql.length() && sql.charAt(index + 1) == '-') {
+                index = skipLineCommentSql(sql, index);
+            } else if (ch == '/' && index + 1 < sql.length() && sql.charAt(index + 1) == '*') {
+                index = skipBlockCommentSql(sql, index);
+            } else if (ch == '?') {
+                count++;
+            } else if (ch == ':') {
+                int end = oracleBindMarkerEnd(sql, index);
+                if (end > index) {
+                    count++;
+                    index = end - 1;
+                }
+            }
+        }
+        return count;
+    }
+
+    private static int oracleBindMarkerEnd(String sql, int index) {
+        if (index + 1 >= sql.length() || (index > 0 && sql.charAt(index - 1) == ':')) {
+            return index;
+        }
+        char next = sql.charAt(index + 1);
+        int end = index + 2;
+        if (next >= '0' && next <= '9') {
+            while (end < sql.length() && sql.charAt(end) >= '0' && sql.charAt(end) <= '9') {
+                end++;
+            }
+            return end;
+        }
+        if (!isOracleIdentifierStart(next)) {
+            return index;
+        }
+        while (end < sql.length() && isOracleIdentifierPart(sql.charAt(end))) {
+            end++;
+        }
+        return end;
+    }
+
+    private static boolean isOracleIdentifierStart(char ch) {
+        return (ch >= 'a' && ch <= 'z')
+            || (ch >= 'A' && ch <= 'Z')
+            || ch == '_'
+            || ch == '$'
+            || ch == '#';
+    }
+
+    private static boolean isOracleIdentifierPart(char ch) {
+        return isOracleIdentifierStart(ch) || (ch >= '0' && ch <= '9');
+    }
+
+    private static int skipSingleQuotedSql(String sql, int index) {
+        for (int current = index + 1; current < sql.length(); current++) {
+            if (sql.charAt(current) != '\'') {
+                continue;
+            }
+            if (current + 1 < sql.length() && sql.charAt(current + 1) == '\'') {
+                current++;
+                continue;
+            }
+            return current;
+        }
+        return sql.length() - 1;
+    }
+
+    private static int skipDoubleQuotedSql(String sql, int index) {
+        for (int current = index + 1; current < sql.length(); current++) {
+            if (sql.charAt(current) != '"') {
+                continue;
+            }
+            if (current + 1 < sql.length() && sql.charAt(current + 1) == '"') {
+                current++;
+                continue;
+            }
+            return current;
+        }
+        return sql.length() - 1;
+    }
+
+    private static int skipOracleAlternativeQuotedSql(String sql, int index) {
+        if (index + 2 >= sql.length() || sql.charAt(index + 1) != '\'') {
+            return index;
+        }
+        char open = sql.charAt(index + 2);
+        char close = switch (open) {
+            case '[' -> ']';
+            case '{' -> '}';
+            case '(' -> ')';
+            case '<' -> '>';
+            default -> open;
+        };
+        for (int current = index + 3; current + 1 < sql.length(); current++) {
+            if (sql.charAt(current) == close && sql.charAt(current + 1) == '\'') {
+                return current + 1;
+            }
+        }
+        return sql.length() - 1;
+    }
+
+    private static int skipLineCommentSql(String sql, int index) {
+        for (int current = index; current < sql.length(); current++) {
+            char ch = sql.charAt(current);
+            if (ch == '\n' || ch == '\r') {
+                return current;
+            }
+        }
+        return sql.length() - 1;
+    }
+
+    private static int skipBlockCommentSql(String sql, int index) {
+        int end = sql.indexOf("*/", index + 2);
+        return end < 0 ? sql.length() - 1 : end + 1;
+    }
+
+    private static void applyExplainTimeout(Statement statement, int timeoutSecs) throws SQLException {
+        if (timeoutSecs >= 0) {
+            try {
+                statement.setQueryTimeout(timeoutSecs);
+            } catch (SQLFeatureNotSupportedException | UnsupportedOperationException ignored) {}
+        }
     }
 
     private static void applyStatementOptions(
@@ -1261,7 +1719,8 @@ public final class DbxJdbcPlugin {
     }
 
     private static void applyExecutionContext(JsonNode connection, Connection conn, String database, String schema) throws SQLException {
-        if (driverQuirks(connection).skipExecutionContext()) {
+        JdbcDriverQuirks quirks = driverQuirks(connection);
+        if (quirks.skipExecutionContext()) {
             return;
         }
         String catalog = emptyToNull(database);
@@ -1270,7 +1729,13 @@ public final class DbxJdbcPlugin {
                 conn.setCatalog(catalog);
             } catch (SQLFeatureNotSupportedException | AbstractMethodError | UnsupportedOperationException ignored) {
             }
-            if (driverQuirks(connection).useCatalogFallbackSql()) {
+            if (quirks.databaseClientInfoProperty() != null) {
+                try {
+                    conn.setClientInfo(quirks.databaseClientInfoProperty(), catalog);
+                } catch (SQLClientInfoException | AbstractMethodError | UnsupportedOperationException ignored) {
+                }
+            }
+            if (quirks.useCatalogFallbackSql()) {
                 applyUseCatalogFallback(conn, catalog);
             }
         }
@@ -1304,7 +1769,7 @@ public final class DbxJdbcPlugin {
             }
         }
         if (isKyuubiDriver(connection)) {
-            return USE_CATALOG_QUIRKS;
+            return HIVE_QUIRKS;
         }
         return DEFAULT_QUIRKS;
     }
@@ -1333,14 +1798,19 @@ public final class DbxJdbcPlugin {
     private static JsonNode listDatabases(JsonNode connection) throws SQLException {
         ArrayNode result = MAPPER.createArrayNode();
         Connection conn = openConnection(connection);
-        if (driverQuirks(connection).useOracleMetadata()) {
+        JdbcDriverQuirks quirks = driverQuirks(connection);
+        if (quirks.useOracleMetadata()) {
             return result;
         }
-        try (ResultSet rs = conn.getMetaData().getCatalogs()) {
+        DatabaseMetaData metadata = conn.getMetaData();
+        try (ResultSet rs = metadata.getCatalogs()) {
             while (rs.next()) {
                 String name = rs.getString("TABLE_CAT");
                 addDatabase(result, name);
             }
+        }
+        if (result.isEmpty() && quirks.schemasAsDatabasesFallback()) {
+            addSchemaDatabases(result, metadata);
         }
         addDatabase(result, optionalText(connection, "database"));
         try {
@@ -1348,6 +1818,15 @@ public final class DbxJdbcPlugin {
         } catch (SQLFeatureNotSupportedException | AbstractMethodError | UnsupportedOperationException ignored) {
         }
         return result;
+    }
+
+    private static void addSchemaDatabases(ArrayNode result, DatabaseMetaData metadata) {
+        try (ResultSet rs = metadata.getSchemas()) {
+            while (rs.next()) {
+                addDatabase(result, rs.getString("TABLE_SCHEM"));
+            }
+        } catch (SQLException | AbstractMethodError | UnsupportedOperationException ignored) {
+        }
     }
 
     private static void addDatabase(ArrayNode result, String name) {
@@ -1496,6 +1975,7 @@ public final class DbxJdbcPlugin {
         JdbcDriverQuirks quirks = driverQuirks(connection);
         String catalog = metadataCatalog(database, quirks);
         String schemaPattern = resolveSchemaPattern(meta, database, schema, quirks);
+        Set<String> allowedObjectTypes = normalizedObjectTypes(objectTypes);
 
         if (!kingbase) {
             String[] tableTypes = constrainedJdbcTableTypes(jdbcTableTypes(meta), objectTypes);
@@ -1507,16 +1987,18 @@ public final class DbxJdbcPlugin {
             }
         }
 
-        try (ResultSet rs = meta.getProcedures(catalog, schemaPattern, "%")) {
-            while (rs.next()) {
-                ObjectNode item = MAPPER.createObjectNode();
-                item.put("name", rs.getString("PROCEDURE_NAME"));
-                item.put("object_type", "PROCEDURE");
-                putNullable(item, "schema", schema);
-                putNullable(item, "comment", rs.getString("REMARKS"));
-                result.add(item);
+        if (allowedObjectTypes.isEmpty() || allowedObjectTypes.contains("PROCEDURE")) {
+            try (ResultSet rs = meta.getProcedures(catalog, schemaPattern, "%")) {
+                while (rs != null && rs.next()) {
+                    ObjectNode item = MAPPER.createObjectNode();
+                    item.put("name", rs.getString("PROCEDURE_NAME"));
+                    item.put("object_type", "PROCEDURE");
+                    putNullable(item, "schema", schema);
+                    putNullable(item, "comment", rs.getString("REMARKS"));
+                    result.add(item);
+                }
+            } catch (SQLException ignored) {
             }
-        } catch (SQLException ignored) {
         }
 
         Set<String> procedureNames = new HashSet<>();
@@ -1525,22 +2007,56 @@ public final class DbxJdbcPlugin {
                 procedureNames.add(node.path("name").asText());
             }
         }
-        try (ResultSet rs = meta.getFunctions(catalog, schemaPattern, "%")) {
-            while (rs.next()) {
-                String name = rs.getString("FUNCTION_NAME");
-                if (!procedureNames.contains(name)) {
+        if (allowedObjectTypes.isEmpty() || allowedObjectTypes.contains("FUNCTION")) {
+            try (ResultSet rs = meta.getFunctions(catalog, schemaPattern, "%")) {
+                while (rs != null && rs.next()) {
+                    String name = rs.getString("FUNCTION_NAME");
+                    if (!procedureNames.contains(name)) {
+                        ObjectNode item = MAPPER.createObjectNode();
+                        item.put("name", name);
+                        item.put("object_type", "FUNCTION");
+                        putNullable(item, "schema", schema);
+                        putNullable(item, "comment", rs.getString("REMARKS"));
+                        result.add(item);
+                    }
+                }
+            } catch (SQLException ignored) {
+            }
+        }
+
+        if ((allowedObjectTypes.isEmpty() || allowedObjectTypes.contains("EVENT")) && isMysqlFamilyConnection(connection)) {
+            appendMysqlEvents(result, conn, database, schema);
+        }
+
+        return filterMetadataNodes(result, filter, limit, offset, objectTypes, "object_type", false);
+    }
+
+    private static boolean isMysqlFamilyConnection(JsonNode connection) {
+        String url = jdbcUrl(connection);
+        return urlMatchesPrefix(url, "jdbc:mysql:") || urlMatchesPrefix(url, "jdbc:mariadb:") || urlMatchesPrefix(url, "jdbc:tidb:");
+    }
+
+    private static void appendMysqlEvents(ArrayNode result, Connection conn, String database, String schema) {
+        String eventSchema = emptyToNull(schema) != null ? schema : database;
+        if (eventSchema == null || eventSchema.isBlank()) return;
+        String sql = "SELECT EVENT_NAME, EVENT_SCHEMA, EVENT_COMMENT, CREATED, LAST_ALTERED FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ?";
+        try (PreparedStatement statement = conn.prepareStatement(sql)) {
+            statement.setString(1, eventSchema);
+            try (ResultSet rs = statement.executeQuery()) {
+                while (rs.next()) {
                     ObjectNode item = MAPPER.createObjectNode();
-                    item.put("name", name);
-                    item.put("object_type", "FUNCTION");
-                    putNullable(item, "schema", schema);
-                    putNullable(item, "comment", rs.getString("REMARKS"));
+                    item.put("name", rs.getString("EVENT_NAME"));
+                    item.put("object_type", "EVENT");
+                    putNullable(item, "schema", rs.getString("EVENT_SCHEMA"));
+                    putNullable(item, "comment", rs.getString("EVENT_COMMENT"));
+                    putNullable(item, "created_at", rs.getString("CREATED"));
+                    putNullable(item, "updated_at", rs.getString("LAST_ALTERED"));
                     result.add(item);
                 }
             }
         } catch (SQLException ignored) {
+            // Lack of EVENT privilege must not hide tables and routines.
         }
-
-        return filterMetadataNodes(result, filter, limit, offset, objectTypes, "object_type", false);
     }
 
     private static JsonNode listDataTypes(JsonNode connection, String database) throws SQLException {
@@ -1586,12 +2102,12 @@ public final class DbxJdbcPlugin {
         JdbcDriverQuirks quirks = driverQuirks(connection);
         String catalog = metadataCatalog(database, quirks);
         String schemaPattern = resolveSchemaPattern(meta, database, schema, quirks);
-        Set<String> primaryKeys = safePrimaryKeys(meta, catalog, schemaPattern, table);
-        appendColumns(result, meta, catalog, schemaPattern, table, primaryKeys);
+        JdbcMetadataIdentity identity = appendColumns(result, meta, catalog, schemaPattern, table);
         if (result.isEmpty() && catalog != null) {
-            primaryKeys = safePrimaryKeys(meta, null, schemaPattern, table);
-            appendColumns(result, meta, null, schemaPattern, table, primaryKeys);
+            identity = appendColumns(result, meta, null, schemaPattern, table);
         }
+        Set<String> primaryKeys = safePrimaryKeys(meta, identity.catalog(), identity.schema(), identity.table());
+        markPrimaryKeyColumns(result, primaryKeys);
         if (quirks.useCatalogFallbackSql()) {
             mergeShowFullColumnMetadata(conn, result, schemaPattern, table);
         }
@@ -2280,22 +2796,31 @@ public final class DbxJdbcPlugin {
         return "'" + (value == null ? "" : value).replace("'", "''") + "'";
     }
 
-    private static void appendColumns(
+    private static JdbcMetadataIdentity appendColumns(
         ArrayNode result,
         DatabaseMetaData meta,
         String catalog,
         String schema,
-        String table,
-        Set<String> primaryKeys
+        String table
     ) throws SQLException {
+        JdbcMetadataIdentity identity = new JdbcMetadataIdentity(catalog, schema, table);
+        boolean identityResolved = false;
         try (ResultSet rs = meta.getColumns(catalog, schema, table, "%")) {
             while (rs.next()) {
+                if (!identityResolved) {
+                    identity = new JdbcMetadataIdentity(
+                        metadataIdentityValue(rs, "TABLE_CAT", catalog, true),
+                        metadataIdentityValue(rs, "TABLE_SCHEM", schema, true),
+                        metadataIdentityValue(rs, "TABLE_NAME", table, false)
+                    );
+                    identityResolved = true;
+                }
                 String name = rs.getString("COLUMN_NAME");
                 ObjectNode item = columnNode(result, name);
                 item.put("data_type", rs.getString("TYPE_NAME"));
                 item.put("is_nullable", columnIsNullable(rs));
                 putNullablePreferValue(item, "column_default", rs.getString("COLUMN_DEF"));
-                item.put("is_primary_key", primaryKeys.contains(name));
+                item.put("is_primary_key", false);
                 item.putNull("extra");
                 putNullablePreferValue(item, "comment", rs.getString("REMARKS"));
                 putNullableInt(item, "numeric_precision", rs.getObject("COLUMN_SIZE"));
@@ -2303,7 +2828,54 @@ public final class DbxJdbcPlugin {
                 putNullableInt(item, "character_maximum_length", rs.getObject("COLUMN_SIZE"));
             }
         }
+        return identity;
     }
+
+    private static String metadataIdentityValue(ResultSet rs, String field, String fallback, boolean nullIsMeaningful) {
+        try {
+            String value = rs.getString(field);
+            if (value == null) {
+                return nullIsMeaningful ? null : fallback;
+            }
+            return value.isBlank() ? fallback : value;
+        } catch (SQLException ignored) {
+            return fallback;
+        }
+    }
+
+    private static void markPrimaryKeyColumns(ArrayNode columns, Set<String> primaryKeys) {
+        Map<String, ObjectNode> exactMatches = new HashMap<>();
+        Map<String, ObjectNode> caseInsensitiveMatches = new HashMap<>();
+        for (JsonNode column : columns) {
+            if (!(column instanceof ObjectNode objectNode)) {
+                continue;
+            }
+            String columnName = objectNode.path("name").asText();
+            exactMatches.put(columnName, objectNode);
+            String normalizedName = columnName.toLowerCase(Locale.ROOT);
+            if (caseInsensitiveMatches.containsKey(normalizedName)) {
+                caseInsensitiveMatches.put(normalizedName, null);
+            } else {
+                caseInsensitiveMatches.put(normalizedName, objectNode);
+            }
+        }
+        for (String primaryKey : primaryKeys) {
+            if (primaryKey == null) {
+                continue;
+            }
+            ObjectNode exactMatch = exactMatches.get(primaryKey);
+            if (exactMatch != null) {
+                exactMatch.put("is_primary_key", true);
+                continue;
+            }
+            ObjectNode caseInsensitiveMatch = caseInsensitiveMatches.get(primaryKey.toLowerCase(Locale.ROOT));
+            if (caseInsensitiveMatch != null) {
+                caseInsensitiveMatch.put("is_primary_key", true);
+            }
+        }
+    }
+
+    private record JdbcMetadataIdentity(String catalog, String schema, String table) {}
 
     private static boolean columnIsNullable(ResultSet rs) throws SQLException {
         try {
@@ -2367,6 +2939,12 @@ public final class DbxJdbcPlugin {
     private static void closeSharedConnection() {
         closeAllQuerySessions();
         if (sharedConnection != null) {
+            if (manualTransactionActive) {
+                try {
+                    sharedConnection.rollback();
+                } catch (SQLException ignored) {
+                }
+            }
             try {
                 sharedConnection.close();
             } catch (SQLException ignored) {
@@ -2374,6 +2952,7 @@ public final class DbxJdbcPlugin {
             sharedConnection = null;
             sharedConnectionKey = "";
         }
+        manualTransactionActive = false;
     }
 
     private static String driverKey(JsonNode connection) {
@@ -2570,7 +3149,11 @@ public final class DbxJdbcPlugin {
     }
 
     private static String jdbcUrlParamSeparator(String base) {
-        if (urlMatchesPrefix(base, "jdbc:sqlserver:") || urlMatchesPrefix(base, "jdbc:dremio:")) {
+        if (
+            urlMatchesPrefix(base, "jdbc:sqlserver:") ||
+            urlMatchesPrefix(base, "jdbc:dremio:") ||
+            isPhoenixUrl(base)
+        ) {
             return base.endsWith(";") ? "" : ";";
         }
         if (jdbcUrlUsesColonProperties(base)) {
@@ -2855,23 +3438,65 @@ public final class DbxJdbcPlugin {
         return keys;
     }
 
-    private static Object readValue(ResultSet rs, ResultSetMetaData meta, int index) throws SQLException {
+    private static Object readValue(
+        ResultSet rs,
+        ResultSetMetaData meta,
+        int index,
+        boolean preserveOracleDateTime
+    ) throws SQLException {
+        return readValue(rs, meta, index, preserveOracleDateTime, null);
+    }
+
+    private static Object readValue(
+        ResultSet rs,
+        ResultSetMetaData meta,
+        int index,
+        boolean preserveOracleDateTime,
+        ZoneId timestampZone
+    ) throws SQLException {
+        int columnType = meta.getColumnType(index);
+
+        if (columnType == Types.BOOLEAN) {
+            boolean boolValue = rs.getBoolean(index);
+            if (!rs.wasNull()) {
+                return boolValue;
+            }
+            return null;
+        }
+
+        // Phoenix exposes VARBINARY_ENCODED as a private type id (9000). Read it through the
+        // binary JDBC accessor before a generic getObject() path can ask the driver for an
+        // unsupported Java representation.
+        if (isPhoenixEncodedBinaryColumn(meta, index, columnType)) {
+            byte[] bytes = rs.getBytes(index);
+            return bytes == null ? null : binaryToHex(bytes);
+        }
+
         Object value = rs.getObject(index);
         if (value == null) {
             return null;
         }
         if (value instanceof byte[] bytes) {
+            if (columnType == Types.BIT && bytes.length == 1 && (bytes[0] == 't' || bytes[0] == 'f')) {
+                return bytes[0] == 't';
+            }
             return binaryToHex(bytes);
+        }
+        if (value instanceof Clob clob) {
+            return clobToString(clob);
         }
         if (isBinaryColumn(meta, index)) {
             byte[] bytes = rs.getBytes(index);
             return bytes == null ? null : binaryToHex(bytes);
         }
-        Object temporalValue = readTemporalValue(rs, meta, index);
+        Object temporalValue = readTemporalValue(rs, meta, index, preserveOracleDateTime, timestampZone);
         if (temporalValue != null) {
             return temporalValue;
         }
-        if (value instanceof Date || value instanceof Time || value instanceof Timestamp || value instanceof TemporalAccessor) {
+        if (value instanceof Timestamp timestamp) {
+            return formatTimestamp(timestamp, timestampZone);
+        }
+        if (value instanceof Date || value instanceof Time || value instanceof TemporalAccessor) {
             return value.toString();
         }
         if (value instanceof BigDecimal decimal) {
@@ -2883,9 +3508,33 @@ public final class DbxJdbcPlugin {
         return value.toString();
     }
 
-    private static Object readTemporalValue(ResultSet rs, ResultSetMetaData meta, int index) throws SQLException {
+    private static String clobToString(Clob clob) throws SQLException {
+        try (Reader reader = clob.getCharacterStream()) {
+            StringBuilder out = new StringBuilder();
+            char[] buffer = new char[8192];
+            int count;
+            while ((count = reader.read(buffer)) != -1) {
+                out.append(buffer, 0, count);
+            }
+            return out.toString();
+        } catch (IOException error) {
+            throw new SQLException("Failed to read CLOB value", error);
+        }
+    }
+
+    private static Object readTemporalValue(
+        ResultSet rs,
+        ResultSetMetaData meta,
+        int index,
+        boolean preserveOracleDateTime,
+        ZoneId timestampZone
+    ) throws SQLException {
         return switch (meta.getColumnType(index)) {
             case Types.DATE -> {
+                if (preserveOracleDateTime) {
+                    Timestamp timestamp = rs.getTimestamp(index);
+                    yield timestamp == null ? null : timestamp.toString();
+                }
                 Date date = rs.getDate(index);
                 yield date == null ? null : date.toString();
             }
@@ -2895,10 +3544,18 @@ public final class DbxJdbcPlugin {
             }
             case Types.TIMESTAMP -> {
                 Timestamp timestamp = rs.getTimestamp(index);
-                yield timestamp == null ? null : timestamp.toString();
+                yield timestamp == null ? null : formatTimestamp(timestamp, timestampZone);
             }
             default -> null;
         };
+    }
+
+    static String formatTimestamp(Timestamp timestamp, ZoneId timestampZone) {
+        if (timestampZone == null) {
+            return timestamp.toString();
+        }
+        LocalDateTime local = LocalDateTime.ofInstant(timestamp.toInstant(), timestampZone);
+        return Timestamp.valueOf(local).toString();
     }
 
     private static boolean isBinaryColumn(ResultSetMetaData meta, int index) throws SQLException {
@@ -2909,6 +3566,69 @@ public final class DbxJdbcPlugin {
                  Types.BLOB -> true;
             default -> false;
         };
+    }
+
+    private static boolean isPhoenixEncodedBinaryColumn(
+        ResultSetMetaData meta,
+        int index,
+        int columnType
+    ) throws SQLException {
+        return columnType == PHOENIX_VARBINARY_ENCODED_TYPE
+            && PHOENIX_VARBINARY_ENCODED_TYPE_NAME.equalsIgnoreCase(meta.getColumnTypeName(index));
+    }
+
+    private static boolean isPhoenixEncodedBinaryType(int sqlType, String typeName) {
+        return sqlType == PHOENIX_VARBINARY_ENCODED_TYPE
+            || PHOENIX_VARBINARY_ENCODED_TYPE_NAME.equalsIgnoreCase(typeName);
+    }
+
+    static String rewritePhoenixSystemCatalogQuery(
+        JsonNode connection,
+        Connection jdbcConnection,
+        String sql
+    ) {
+        String url = jdbcUrl(connection);
+        String normalizedSql = stripLeadingSqlComments(trimStatementSql(sql));
+        if (
+            !isPhoenixConnection(connection, url)
+                || !PHOENIX_SYSTEM_CATALOG_WILDCARD.matcher(normalizedSql).matches()
+        ) {
+            return sql;
+        }
+
+        List<String> projections = new ArrayList<>();
+        boolean hasEncodedColumn = false;
+        try (ResultSet columns = jdbcConnection.getMetaData().getColumns(null, "SYSTEM", "CATALOG", "%")) {
+            while (columns.next()) {
+                String columnName = columns.getString("COLUMN_NAME");
+                if (columnName == null || columnName.isBlank()) {
+                    continue;
+                }
+                int sqlType = columns.getInt("DATA_TYPE");
+                String typeName = columns.getString("TYPE_NAME");
+                String quotedColumn = quotePhoenixIdentifier(columnName);
+                if (isPhoenixEncodedBinaryType(sqlType, typeName)) {
+                    projections.add("CAST(" + quotedColumn + " AS VARBINARY) AS " + quotedColumn);
+                    hasEncodedColumn = true;
+                } else {
+                    projections.add(quotedColumn);
+                }
+            }
+        } catch (SQLException | RuntimeException ignored) {
+            // Keep the original SQL when a driver cannot expose its column metadata. The
+            // compatibility path must not turn an optional workaround into a new failure.
+            return sql;
+        }
+
+        if (!hasEncodedColumn || projections.isEmpty()) {
+            return sql;
+        }
+        return "SELECT " + String.join(", ", projections)
+            + " FROM " + quotePhoenixIdentifier("SYSTEM") + "." + quotePhoenixIdentifier("CATALOG");
+    }
+
+    private static String quotePhoenixIdentifier(String identifier) {
+        return "\"" + identifier.replace("\"", "\"\"") + "\"";
     }
 
     private static String binaryToHex(byte[] bytes) {

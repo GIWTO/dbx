@@ -5,8 +5,10 @@ describe("shortcutRegistry editor actions", () => {
   const formatterEditorActionIds: ShortcutActionId[] = [
     "formatSql",
     "toggleLineComment",
+    "toggleBlockComment",
     "indentMore",
     "indentLess",
+    "joinLines",
     "duplicateLine",
     "deleteLine",
     "moveLineUp",
@@ -19,8 +21,9 @@ describe("shortcutRegistry editor actions", () => {
     "uppercaseSelection",
     "lowercaseSelection",
     "exPasteSqlInCondition",
+    "toggleFold",
   ];
-  const sidebarShortcutActionIds: ShortcutActionId[] = ["copySidebarSelection", "pasteSidebarSelection", "editSidebarConnection"];
+  const sidebarShortcutActionIds: ShortcutActionId[] = ["copySidebarSelection", "pasteSidebarSelection", "editSidebarConnection", "viewTableDdl"];
 
   it("registers the new-data-tab mouse modifier as a configurable sidebar shortcut", () => {
     const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "openDataInNewTab");
@@ -28,6 +31,55 @@ describe("shortcutRegistry editor actions", () => {
     expect(definition).toMatchObject({ scope: "sidebar", defaultShortcut: "Alt", inputKind: "modifier-only" });
     expect(DEFAULT_SHORTCUT_SETTINGS.openDataInNewTab).toBe("Alt");
     expect(formatShortcut(DEFAULT_SHORTCUT_SETTINGS.openDataInNewTab, "MacIntel")).toBe("Alt");
+  });
+
+  it("registers a conflict-free DBeaver-style shortcut for executing in a new result tab", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "executeSqlInNewResultTab");
+
+    expect(definition).toMatchObject({ scope: "editor", defaultShortcut: "Mod+\\" });
+    expect(DEFAULT_SHORTCUT_SETTINGS.executeSqlInNewResultTab).toBe("Mod+\\");
+    expect(formatShortcut(DEFAULT_SHORTCUT_SETTINGS.executeSqlInNewResultTab, "MacIntel")).toBe("Cmd+\\");
+    expect(formatShortcut(DEFAULT_SHORTCUT_SETTINGS.executeSqlInNewResultTab, "Win32")).toBe("Ctrl+\\");
+    expect(shortcutToCodeMirrorKey(DEFAULT_SHORTCUT_SETTINGS.executeSqlInNewResultTab)).toBe("Mod-\\");
+    expect(findShortcutConflict("executeSqlInNewResultTab", DEFAULT_SHORTCUT_SETTINGS.executeSqlInNewResultTab, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
+  it("registers a conflict-free shortcut for expanding SELECT stars", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "expandSelectStar");
+
+    expect(definition).toMatchObject({ scope: "editor", defaultShortcut: "Mod+Shift+X" });
+    expect(shortcutToCodeMirrorKey(DEFAULT_SHORTCUT_SETTINGS.expandSelectStar)).toBe("Mod-Shift-x");
+    expect(findShortcutConflict("expandSelectStar", DEFAULT_SHORTCUT_SETTINGS.expandSelectStar, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
+  it("keeps current-view search and editor find contextual on Mod+F", () => {
+    const focusSearch = SHORTCUT_DEFINITIONS.find((item) => item.id === "focusSearch");
+    const find = SHORTCUT_DEFINITIONS.find((item) => item.id === "find");
+
+    expect(focusSearch).toMatchObject({ scope: "global", defaultShortcut: "Mod+F" });
+    expect(find).toMatchObject({ scope: "editor", defaultShortcut: "Mod+F" });
+    expect(findShortcutConflict("focusSearch", DEFAULT_SHORTCUT_SETTINGS.focusSearch, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+    expect(findShortcutConflict("find", DEFAULT_SHORTCUT_SETTINGS.find, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
+  it("uses Shift+Enter for inserting a complete line below", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "insertLineBelow");
+
+    expect(definition).toMatchObject({ scope: "editor", defaultShortcut: "Shift+Enter" });
+    expect(DEFAULT_SHORTCUT_SETTINGS.insertLineBelow).toBe("Shift+Enter");
+    expect(shortcutToCodeMirrorKey(DEFAULT_SHORTCUT_SETTINGS.insertLineBelow)).toBe("Shift-Enter");
+    expect(findShortcutConflict("insertLineBelow", DEFAULT_SHORTCUT_SETTINGS.insertLineBelow, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
+  it("registers a conflict-free platform shortcut for joining lines", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "joinLines");
+
+    expect(definition).toMatchObject({ scope: "editor", defaultShortcut: "Mod+J" });
+    expect(DEFAULT_SHORTCUT_SETTINGS.joinLines).toBe("Mod+J");
+    expect(formatShortcut(DEFAULT_SHORTCUT_SETTINGS.joinLines, "MacIntel")).toBe("Cmd+J");
+    expect(formatShortcut(DEFAULT_SHORTCUT_SETTINGS.joinLines, "Win32")).toBe("Ctrl+J");
+    expect(shortcutToCodeMirrorKey(DEFAULT_SHORTCUT_SETTINGS.joinLines)).toBe("Mod-j");
+    expect(findShortcutConflict("joinLines", DEFAULT_SHORTCUT_SETTINGS.joinLines, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
   });
 
   it("resolves the close-other-tabs default per platform and heals cross-platform synced defaults", () => {
@@ -75,8 +127,10 @@ describe("shortcutRegistry editor actions", () => {
     expect(shortcuts.executeSql).toBe("Mod+Shift+Enter");
     expect(shortcuts.formatSql).toBe("Shift+Mod+F");
     expect(shortcuts.toggleLineComment).toBe("Mod+/");
+    expect(shortcuts.toggleBlockComment).toBe("Shift+Alt+A");
     expect(shortcuts.indentMore).toBe("");
     expect(shortcuts.indentLess).toBe("Shift+Tab");
+    expect(shortcuts.joinLines).toBe("Mod+J");
     expect(shortcuts.duplicateLine).toBe("Mod+D");
     expect(shortcuts.deleteLine).toBe("Shift+Mod+K");
     expect(shortcuts.moveLineUp).toBe("Alt+ArrowUp");
@@ -86,9 +140,29 @@ describe("shortcutRegistry editor actions", () => {
     expect(shortcuts.undo).toBe("Mod+Z");
     expect(shortcuts.redo).toBe("Shift+Mod+Z");
     expect(shortcuts.selectAll).toBe("Mod+A");
+    expect(shortcuts.extendSelection).toBe("Alt+W");
     expect(shortcuts.uppercaseSelection).toBe("Shift+Alt+U");
     expect(shortcuts.lowercaseSelection).toBe("Shift+Alt+L");
     expect(shortcuts.exPasteSqlInCondition).toBe("");
+    expect(shortcuts.toggleFold).toBe("Mod+.");
+  });
+
+  it("registers IntelliJ-style extend selection as a configurable editor shortcut", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "extendSelection");
+
+    expect(definition).toMatchObject({ scope: "editor", defaultShortcut: "Alt+W" });
+    expect(DEFAULT_SHORTCUT_SETTINGS.extendSelection).toBe("Alt+W");
+  });
+
+  it("registers an IDEA/DataGrip-style Alt+/ shortcut for manually triggering completion", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "triggerCompletion");
+
+    expect(definition).toMatchObject({ scope: "editor", defaultShortcut: "Alt+/" });
+    expect(DEFAULT_SHORTCUT_SETTINGS.triggerCompletion).toBe("Alt+/");
+    expect(formatShortcut(DEFAULT_SHORTCUT_SETTINGS.triggerCompletion, "Win32")).toBe("Alt+/");
+    expect(formatShortcut(DEFAULT_SHORTCUT_SETTINGS.triggerCompletion, "MacIntel")).toBe("Alt+/");
+    expect(shortcutToCodeMirrorKey(DEFAULT_SHORTCUT_SETTINGS.triggerCompletion)).toBe("Alt-/");
+    expect(findShortcutConflict("triggerCompletion", DEFAULT_SHORTCUT_SETTINGS.triggerCompletion, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
   });
 
   it("detects conflicts between formatter editor shortcuts and other editor shortcuts", () => {

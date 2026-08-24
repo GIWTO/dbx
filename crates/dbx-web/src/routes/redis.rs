@@ -78,6 +78,44 @@ pub struct RedisKeyRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RedisRenameKeyRequest {
+    pub connection_id: String,
+    pub db: u32,
+    pub key_raw: String,
+    pub new_key_raw: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisStreamEntriesRequest {
+    pub connection_id: String,
+    pub db: u32,
+    pub key_raw: String,
+    pub cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisStreamGroupRequest {
+    pub connection_id: String,
+    pub db: u32,
+    pub key_raw: String,
+    pub group_raw: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisStreamPendingRequest {
+    pub connection_id: String,
+    pub db: u32,
+    pub key_raw: String,
+    pub group_raw: String,
+    pub cursor: Option<String>,
+    pub consumer_raw: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RedisLoadMoreRequest {
     pub connection_id: String,
     pub db: u32,
@@ -86,6 +124,7 @@ pub struct RedisLoadMoreRequest {
     pub cursor: u64,
     pub count: usize,
     pub filter: Option<String>,
+    pub sort_direction: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -111,6 +150,26 @@ pub struct RedisHashRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RedisHashFieldTtlRequest {
+    pub connection_id: String,
+    pub db: u32,
+    pub key_raw: String,
+    pub field: String,
+    pub ttl: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisHashFieldExpireAtRequest {
+    pub connection_id: String,
+    pub db: u32,
+    pub key_raw: String,
+    pub field: String,
+    pub expire_at: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RedisZaddRequest {
     pub connection_id: String,
     pub db: u32,
@@ -118,6 +177,18 @@ pub struct RedisZaddRequest {
     pub member: String,
     pub score: f64,
     pub ttl: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisZsetUpdateRequest {
+    pub connection_id: String,
+    pub db: u32,
+    pub key_raw: String,
+    pub original_member: String,
+    pub expected_score: String,
+    pub member: String,
+    pub score: String,
 }
 
 #[derive(Deserialize)]
@@ -160,6 +231,24 @@ pub struct RedisJsonSetRequest {
     pub key_raw: String,
     pub value: String,
     pub ttl: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisSetTtlRequest {
+    pub connection_id: String,
+    pub db: u32,
+    pub key_raw: String,
+    pub ttl: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisSetExpireAtRequest {
+    pub connection_id: String,
+    pub db: u32,
+    pub key_raw: String,
+    pub expire_at: i64,
 }
 
 #[derive(Deserialize)]
@@ -284,6 +373,77 @@ pub async fn get_value(
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
+pub async fn get_ttl(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RedisKeyRequest>,
+) -> Result<Json<i64>, AppError> {
+    let ttl = dbx_core::redis_ops::redis_get_ttl_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(ttl))
+}
+
+pub async fn get_stream_entries(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RedisStreamEntriesRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let result = dbx_core::redis_ops::redis_stream_entries_in_db_core(
+        &state.app,
+        &req.connection_id,
+        req.db,
+        &req.key_raw,
+        req.cursor.as_deref(),
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
+}
+
+pub async fn get_stream_groups(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RedisKeyRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let result =
+        dbx_core::redis_ops::redis_stream_groups_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw)
+            .await
+            .map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
+}
+
+pub async fn get_stream_consumers(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RedisStreamGroupRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let result = dbx_core::redis_ops::redis_stream_consumers_in_db_core(
+        &state.app,
+        &req.connection_id,
+        req.db,
+        &req.key_raw,
+        &req.group_raw,
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
+}
+
+pub async fn get_stream_pending(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RedisStreamPendingRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let result = dbx_core::redis_ops::redis_stream_pending_in_db_core(
+        &state.app,
+        &req.connection_id,
+        req.db,
+        &req.key_raw,
+        &req.group_raw,
+        req.cursor.as_deref(),
+        req.consumer_raw.as_deref(),
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
+}
+
 pub async fn load_more(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisLoadMoreRequest>,
@@ -297,6 +457,7 @@ pub async fn load_more(
         req.cursor,
         req.count,
         req.filter.as_deref(),
+        req.sort_direction.as_deref(),
     )
     .await
     .map_err(AppError::from)?;
@@ -332,6 +493,23 @@ pub async fn delete_key(
     Ok(Json(()))
 }
 
+pub async fn rename_key(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RedisRenameKeyRequest>,
+) -> Result<Json<()>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "RENAMENX").await?;
+    dbx_core::redis_ops::redis_rename_key_in_db_core(
+        &state.app,
+        &req.connection_id,
+        req.db,
+        &req.key_raw,
+        &req.new_key_raw,
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(()))
+}
+
 pub async fn hash_set(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisHashRequest>,
@@ -360,6 +538,42 @@ pub async fn hash_del(
     dbx_core::redis_ops::redis_hash_del_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw, &req.field)
         .await
         .map_err(AppError::from)?;
+    Ok(Json(()))
+}
+
+pub async fn hash_field_set_ttl(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RedisHashFieldTtlRequest>,
+) -> Result<Json<()>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "HEXPIRE").await?;
+    dbx_core::redis_ops::redis_hash_field_set_ttl_in_db_core(
+        &state.app,
+        &req.connection_id,
+        req.db,
+        &req.key_raw,
+        &req.field,
+        req.ttl,
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(()))
+}
+
+pub async fn hash_field_set_expire_at(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RedisHashFieldExpireAtRequest>,
+) -> Result<Json<()>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "HEXPIREAT").await?;
+    dbx_core::redis_ops::redis_hash_field_set_expire_at_in_db_core(
+        &state.app,
+        &req.connection_id,
+        req.db,
+        &req.key_raw,
+        &req.field,
+        req.expire_at,
+    )
+    .await
+    .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -437,6 +651,7 @@ pub async fn set_remove(
 }
 
 pub async fn zadd(State(state): State<Arc<WebState>>, Json(req): Json<RedisZaddRequest>) -> Result<Json<()>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "ZADD").await?;
     dbx_core::redis_ops::redis_zadd_in_db_core(
         &state.app,
         &req.connection_id,
@@ -451,10 +666,31 @@ pub async fn zadd(State(state): State<Arc<WebState>>, Json(req): Json<RedisZaddR
     Ok(Json(()))
 }
 
+pub async fn zset_update(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RedisZsetUpdateRequest>,
+) -> Result<Json<bool>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "ZADD/ZREM").await?;
+    let used_acl_compatibility = dbx_core::redis_ops::redis_zset_update_in_db_core(
+        &state.app,
+        &req.connection_id,
+        req.db,
+        &req.key_raw,
+        &req.original_member,
+        &req.expected_score,
+        &req.member,
+        &req.score,
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(used_acl_compatibility))
+}
+
 pub async fn stream_add(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisStreamAddRequest>,
 ) -> Result<Json<()>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "XADD").await?;
     dbx_core::redis_ops::redis_stream_add_in_db_core(
         &state.app,
         &req.connection_id,
@@ -473,6 +709,7 @@ pub async fn json_set(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisJsonSetRequest>,
 ) -> Result<Json<()>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "JSON.SET").await?;
     dbx_core::redis_ops::redis_json_set_in_db_core(
         &state.app,
         &req.connection_id,
@@ -494,6 +731,34 @@ pub async fn check_json_module(
         .await
         .map_err(AppError::from)?;
     Ok(Json(result))
+}
+
+pub async fn set_ttl(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RedisSetTtlRequest>,
+) -> Result<Json<()>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "EXPIRE").await?;
+    dbx_core::redis_ops::redis_set_ttl_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw, req.ttl)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(()))
+}
+
+pub async fn set_expire_at(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RedisSetExpireAtRequest>,
+) -> Result<Json<()>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "EXPIREAT").await?;
+    dbx_core::redis_ops::redis_set_expire_at_in_db_core(
+        &state.app,
+        &req.connection_id,
+        req.db,
+        &req.key_raw,
+        req.expire_at,
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(()))
 }
 
 pub async fn delete_keys(

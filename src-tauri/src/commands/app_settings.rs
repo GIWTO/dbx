@@ -8,8 +8,8 @@ use tauri::{AppHandle, Manager, State, Window};
 
 use super::connection::AppState;
 use crate::{
-    apply_debug_log_level, apply_desktop_settings, hide_main_window_for_close, refresh_native_menus, request_app_close,
-    AppLocaleState, CloseBehaviorState,
+    apply_debug_log_level, apply_desktop_settings, clear_startup_probe_after_frontend_ready,
+    hide_main_window_for_close, refresh_native_menus, request_app_close, AppLocaleState, CloseBehaviorState,
 };
 
 const DEVELOPMENT_OPEN_TABS_STATE_KEY: &str = "development_open_tabs";
@@ -70,6 +70,16 @@ pub async fn save_max_agent_turns(state: State<'_, Arc<AppState>>, max_agent_tur
 }
 
 #[tauri::command]
+pub async fn load_max_retries(state: State<'_, Arc<AppState>>) -> Result<u32, String> {
+    state.storage.load_max_retries().await
+}
+
+#[tauri::command]
+pub async fn save_max_retries(state: State<'_, Arc<AppState>>, max_retries: u32) -> Result<(), String> {
+    state.storage.save_max_retries(max_retries).await
+}
+
+#[tauri::command]
 pub async fn complete_app_close(app: AppHandle, window: Window, action: String) -> Result<(), String> {
     match action.as_str() {
         "quit" => {
@@ -91,6 +101,7 @@ pub fn mark_frontend_ready(app: AppHandle) -> Result<(), String> {
     let state =
         app.try_state::<CloseBehaviorState>().ok_or_else(|| "close behavior state is unavailable".to_string())?;
     state.set_frontend_ready(true);
+    clear_startup_probe_after_frontend_ready();
     Ok(())
 }
 
@@ -153,6 +164,19 @@ pub async fn save_saved_sql_editor_positions(
     positions: serde_json::Value,
 ) -> Result<(), String> {
     state.storage.save_saved_sql_editor_positions(&positions).await
+}
+
+#[tauri::command]
+pub async fn load_transfer_task_library(state: State<'_, Arc<AppState>>) -> Result<Option<serde_json::Value>, String> {
+    state.storage.load_transfer_task_library().await
+}
+
+#[tauri::command]
+pub async fn save_transfer_task_library(
+    state: State<'_, Arc<AppState>>,
+    library: serde_json::Value,
+) -> Result<(), String> {
+    state.storage.save_transfer_task_library(&library).await
 }
 
 #[tauri::command]

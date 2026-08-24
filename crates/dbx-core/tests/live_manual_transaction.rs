@@ -1,9 +1,12 @@
 use dbx_core::connection::AppState;
+use dbx_core::database_export::{begin_database_backup_snapshot_core, export_database_sql_core, DatabaseExportRequest};
 use dbx_core::models::connection::{ConnectionConfig, DatabaseType};
 use dbx_core::query::{
     begin_manual_transaction, commit_manual_transaction, execute_in_manual_transaction, rollback_manual_transaction,
+    stream_rows_in_manual_transaction,
 };
 use dbx_core::storage::Storage;
+use std::time::{Duration, Instant};
 
 fn live_config(prefix: &str, db_type: DatabaseType, default_port: u16) -> ConnectionConfig {
     let host = std::env::var(format!("{prefix}_HOST")).expect("live DB host env var");
@@ -14,6 +17,7 @@ fn live_config(prefix: &str, db_type: DatabaseType, default_port: u16) -> Connec
     let username = std::env::var(format!("{prefix}_USER")).expect("live DB user env var");
     let password = std::env::var(format!("{prefix}_PASSWORD")).expect("live DB password env var");
     let database = std::env::var(format!("{prefix}_DATABASE")).expect("live DB database env var");
+    let url_params = std::env::var(format!("{prefix}_URL_PARAMS")).ok();
 
     serde_json::from_value(serde_json::json!({
         "id": format!("manual-txn-{prefix}"),
@@ -27,7 +31,8 @@ fn live_config(prefix: &str, db_type: DatabaseType, default_port: u16) -> Connec
         "connect_timeout_secs": 5,
         "query_timeout_secs": 30,
         "idle_timeout_secs": 60,
-        "keepalive_interval_secs": 0
+        "keepalive_interval_secs": 0,
+        "url_params": url_params
     }))
     .expect("live connection config should deserialize")
 }
@@ -47,7 +52,10 @@ async fn live_manual_transaction_postgres_preserves_typed_selects_and_empty_meta
     let database = config.database.clone().expect("database");
     let (state, db_path) = app_state_with_config(config.clone()).await;
 
-    let txn = begin_manual_transaction(&state, &config.id, &database, None).await.expect("begin");
+    let txn = begin_manual_transaction(&state, &config.id, &database, None, None).await.expect("begin");
+    execute_in_manual_transaction(&state, &txn, "DEALLOCATE ALL", &database, None, Some(10))
+        .await
+        .expect("simulate lost prepared statements");
     let typed = execute_in_manual_transaction(
         &state,
         &txn,
@@ -79,13 +87,45 @@ async fn live_manual_transaction_postgres_preserves_typed_selects_and_empty_meta
 }
 
 #[tokio::test]
+#[ignore = "requires DBX_LIVE_MANUAL_TXN_POSTGRES_* env vars pointing at writable PostgreSQL"]
+async fn live_postgres_backup_snapshot_streams_after_server_deallocates_statements() {
+    let config = live_config("DBX_LIVE_MANUAL_TXN_POSTGRES", DatabaseType::Postgres, 5432);
+    let database = config.database.clone().expect("database");
+    let (state, db_path) = app_state_with_config(config.clone()).await;
+
+    let snapshot = begin_database_backup_snapshot_core(&state, &config.id, &database).await.expect("begin snapshot");
+    execute_in_manual_transaction(&state, &snapshot.session_id, "DEALLOCATE ALL", &database, None, Some(10))
+        .await
+        .expect("simulate lost prepared statements");
+
+    let mut batches = Vec::new();
+    let row_count = stream_rows_in_manual_transaction(
+        &state,
+        &snapshot.session_id,
+        "SELECT 1::int4 AS value UNION ALL SELECT 2::int4",
+        1,
+        |batch| {
+            batches.push(batch);
+            Ok(())
+        },
+    )
+    .await
+    .expect("stream through backup snapshot");
+    assert_eq!(row_count, 2);
+    assert_eq!(batches, vec![vec![vec![serde_json::json!(1)]], vec![vec![serde_json::json!(2)]]]);
+
+    rollback_manual_transaction(&state, &snapshot.session_id).await.expect("rollback snapshot");
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
 #[ignore = "requires DBX_LIVE_MANUAL_TXN_MYSQL_* env vars pointing at writable MySQL"]
 async fn live_manual_transaction_mysql_streams_with_row_limit() {
     let config = live_config("DBX_LIVE_MANUAL_TXN_MYSQL", DatabaseType::Mysql, 3306);
     let database = config.database.clone().expect("database");
     let (state, db_path) = app_state_with_config(config.clone()).await;
 
-    let txn = begin_manual_transaction(&state, &config.id, &database, None).await.expect("begin");
+    let txn = begin_manual_transaction(&state, &config.id, &database, None, None).await.expect("begin");
     let limited = execute_in_manual_transaction(
         &state,
         &txn,
@@ -101,5 +141,50 @@ async fn live_manual_transaction_mysql_streams_with_row_limit() {
     assert!(limited[0].truncated);
 
     rollback_manual_transaction(&state, &txn).await.expect("rollback");
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+#[ignore = "requires DBX_LIVE_MANUAL_TXN_MYSQL_* env vars pointing at readable MySQL with table t_0001"]
+async fn live_mysql_database_backup_refreshes_an_idle_snapshot_before_export() {
+    let config = live_config("DBX_LIVE_MANUAL_TXN_MYSQL", DatabaseType::Mysql, 3306);
+    let database = config.database.clone().expect("database");
+    let (state, db_path) = app_state_with_config(config.clone()).await;
+    let export_path = std::env::temp_dir().join(format!("dbx-live-backup-{}.sql", uuid::Uuid::new_v4().simple()));
+
+    let snapshot = begin_database_backup_snapshot_core(&state, &config.id, &database).await.expect("begin snapshot");
+    {
+        let mut sessions = state.transaction_sessions.write().await;
+        sessions.get_mut(&snapshot.session_id).expect("snapshot session").last_activity =
+            Instant::now() - Duration::from_secs(301);
+    }
+
+    let request = DatabaseExportRequest {
+        export_id: format!("live-mysql-backup-{}", uuid::Uuid::new_v4().simple()),
+        connection_id: config.id.clone(),
+        database: database.clone(),
+        schema: database.clone(),
+        file_path: export_path.to_string_lossy().to_string(),
+        selected_tables: vec!["t_0001".to_string()],
+        excluded_tables: Vec::new(),
+        include_structure: true,
+        include_data: true,
+        include_objects: false,
+        include_create_database: false,
+        drop_table_if_exists: false,
+        omit_auto_increment: false,
+        fail_on_error: true,
+        snapshot_session_id: Some(snapshot.session_id.clone()),
+        batch_size: 100,
+    };
+    let export_result = export_database_sql_core(&state, &request, |_| {}).await;
+    let rollback_result = rollback_manual_transaction(&state, &snapshot.session_id).await;
+
+    export_result.expect("export through refreshed snapshot");
+    rollback_result.expect("rollback snapshot");
+    let sql = std::fs::read_to_string(&export_path).expect("read exported SQL");
+    assert!(sql.contains("t_0001"));
+
+    let _ = std::fs::remove_file(export_path);
     let _ = std::fs::remove_file(db_path);
 }

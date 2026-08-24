@@ -1,5 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { driverStoreFocusForInstallError, hasInstalledAgentVersion } from "@/lib/connection/agentDriverInstallHint";
+import { agentDriverInstallKey, driverStoreFocusForInstallError, hasInstalledAgentVersion, showAgentDriverInstallHint } from "@/lib/connection/agentDriverInstallHint";
+
+describe("DuckDB driver installation", () => {
+  it("requires the downloadable DuckDB driver before connecting", () => {
+    expect(agentDriverInstallKey("duckdb")).toBe("duckdb");
+    expect(showAgentDriverInstallHint("duckdb", [])).toBe(true);
+    expect(showAgentDriverInstallHint("duckdb", [{ db_type: "duckdb", installed: true }])).toBe(false);
+  });
+});
+
+describe("HiveServer2-compatible driver installation", () => {
+  it("reuses the downloadable Hive driver", () => {
+    expect(agentDriverInstallKey("impala")).toBe("hive");
+    expect(showAgentDriverInstallHint("impala", [{ db_type: "hive", installed: true }])).toBe(false);
+    expect(agentDriverInstallKey("kyuubi")).toBe("hive");
+    expect(showAgentDriverInstallHint("kyuubi", [{ db_type: "hive", installed: true }])).toBe(false);
+  });
+});
 
 describe("driverStoreFocusForInstallError", () => {
   it("focuses the missing agent driver for driver-not-installed errors", () => {
